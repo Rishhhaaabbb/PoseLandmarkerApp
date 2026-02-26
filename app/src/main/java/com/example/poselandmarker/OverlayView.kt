@@ -79,40 +79,59 @@ class OverlayView @JvmOverloads constructor(
         invalidate()
     }
 
+    /** Get the height of the system status bar so HUD text is drawn below it */
+    private fun getStatusBarHeight(): Int {
+        val resourceId = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (resourceId > 0) resources.getDimensionPixelSize(resourceId) else 80
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
-        // HUD: FPS, inference time, delegate
-        canvas.drawText("FPS: $fps", 32f, 80f, textPaint)
-        canvas.drawText("Inference: ${inferenceTimeMs}ms", 32f, 140f, textPaint)
-        canvas.drawText("Delegate: $delegateName", 32f, 200f, textPaint)
+        // HUD: FPS, inference time, delegate — positioned below the system status bar
+        val topOffset = getStatusBarHeight() + 24f
+        canvas.drawText("FPS: $fps", 32f, topOffset, textPaint)
+        canvas.drawText("Inference: ${inferenceTimeMs}ms", 32f, topOffset + 60f, textPaint)
+        canvas.drawText("Delegate: $delegateName", 32f, topOffset + 120f, textPaint)
 
         val poseLandmarkerResult = results ?: return
         val allLandmarks = poseLandmarkerResult.landmarks()
         if (allLandmarks.isEmpty()) return
 
-        for (landmark in allLandmarks) {
-            // Draw connections using official POSE_LANDMARKS topology
-            PoseLandmarker.POSE_LANDMARKS.forEach { connection ->
-                val startLm = allLandmarks[0][connection!!.start()]
-                val endLm = allLandmarks[0][connection.end()]
-                canvas.drawLine(
-                    startLm.x() * imageWidth * scaleFactor,
-                    startLm.y() * imageHeight * scaleFactor,
-                    endLm.x() * imageWidth * scaleFactor,
-                    endLm.y() * imageHeight * scaleFactor,
-                    linePaint
-                )
-            }
+        // Only draw the first detected person
+        val landmark = allLandmarks[0]
 
-            // Draw landmark points
-            for (normalizedLandmark in landmark) {
-                canvas.drawPoint(
-                    normalizedLandmark.x() * imageWidth * scaleFactor,
-                    normalizedLandmark.y() * imageHeight * scaleFactor,
-                    pointPaint
-                )
+        // Filter out false detections via world landmark visibility
+        val worldLandmarks = poseLandmarkerResult.worldLandmarks()
+        if (worldLandmarks.isNotEmpty()) {
+            val wl = worldLandmarks[0]
+            val keyIndices = intArrayOf(11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
+            val visibleCount = keyIndices.count { idx ->
+                idx < wl.size && wl[idx].visibility().isPresent && wl[idx].visibility().get() > 0.5f
             }
+            if (visibleCount < 4) return
+        }
+
+        // Draw connections using official POSE_LANDMARKS topology
+        PoseLandmarker.POSE_LANDMARKS.forEach { connection ->
+            val startLm = landmark[connection!!.start()]
+            val endLm = landmark[connection.end()]
+            canvas.drawLine(
+                startLm.x() * imageWidth * scaleFactor,
+                startLm.y() * imageHeight * scaleFactor,
+                endLm.x() * imageWidth * scaleFactor,
+                endLm.y() * imageHeight * scaleFactor,
+                linePaint
+            )
+        }
+
+        // Draw landmark points
+        for (normalizedLandmark in landmark) {
+            canvas.drawPoint(
+                normalizedLandmark.x() * imageWidth * scaleFactor,
+                normalizedLandmark.y() * imageHeight * scaleFactor,
+                pointPaint
+            )
         }
     }
 

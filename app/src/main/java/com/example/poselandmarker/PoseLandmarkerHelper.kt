@@ -24,6 +24,10 @@ class PoseLandmarkerHelper(
 ) {
     private var poseLandmarker: PoseLandmarker? = null
 
+    // Reusable bitmap buffer — avoids allocating a new Bitmap every frame
+    private var bitmapBuffer: Bitmap? = null
+    private val matrix = Matrix()
+
     init {
         setupPoseLandmarker()
     }
@@ -74,25 +78,32 @@ class PoseLandmarkerHelper(
     fun detectLiveStream(imageProxy: ImageProxy, isFrontCamera: Boolean) {
         val frameTime = SystemClock.uptimeMillis()
 
-        // Save metadata before closing the proxy
         val imgWidth = imageProxy.width
         val imgHeight = imageProxy.height
         val rotationDegrees = imageProxy.imageInfo.rotationDegrees
 
-        // Copy RGBA pixels from the frame (identical to Google demo)
-        val bitmapBuffer = Bitmap.createBitmap(
-            imgWidth, imgHeight, Bitmap.Config.ARGB_8888
-        )
-        imageProxy.use { bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
-
-        val matrix = Matrix().apply {
-            postRotate(rotationDegrees.toFloat())
-            if (isFrontCamera) {
-                postScale(-1f, 1f, imgWidth.toFloat(), imgHeight.toFloat())
+        // Reuse bitmap buffer if dimensions match, otherwise create once
+        val buffer = bitmapBuffer.let {
+            if (it != null && it.width == imgWidth && it.height == imgHeight) {
+                it
+            } else {
+                it?.recycle()
+                Bitmap.createBitmap(imgWidth, imgHeight, Bitmap.Config.ARGB_8888).also {
+                    bitmapBuffer = it
+                }
             }
         }
+
+        imageProxy.use { buffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
+
+        matrix.reset()
+        matrix.postRotate(rotationDegrees.toFloat())
+        if (isFrontCamera) {
+            matrix.postScale(-1f, 1f, imgWidth.toFloat(), imgHeight.toFloat())
+        }
+
         val rotatedBitmap = Bitmap.createBitmap(
-            bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height,
+            buffer, 0, 0, buffer.width, buffer.height,
             matrix, true
         )
 
@@ -141,8 +152,8 @@ class PoseLandmarkerHelper(
         const val DELEGATE_GPU = 1
         const val OTHER_ERROR = 0
         const val GPU_ERROR = 1
-        const val DEFAULT_POSE_DETECTION_CONFIDENCE = 0.5F
+        const val DEFAULT_POSE_DETECTION_CONFIDENCE = 0.75F
         const val DEFAULT_POSE_TRACKING_CONFIDENCE = 0.5F
-        const val DEFAULT_POSE_PRESENCE_CONFIDENCE = 0.5F
+        const val DEFAULT_POSE_PRESENCE_CONFIDENCE = 0.75F
     }
 }

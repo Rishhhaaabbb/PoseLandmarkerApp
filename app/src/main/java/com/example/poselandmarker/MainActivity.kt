@@ -3,20 +3,20 @@ package com.example.poselandmarker
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
+import android.hardware.camera2.CaptureRequest
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
+import android.util.Range
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Spinner
-import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.AspectRatio
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
@@ -32,6 +32,8 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
     private var poseLandmarkerHelper: PoseLandmarkerHelper? = null
 
     private var currentDelegate = PoseLandmarkerHelper.DELEGATE_GPU
+    private var isFrontCamera = true // Start with front camera
+    private var cameraProvider: ProcessCameraProvider? = null
 
     // FPS tracking
     private var frameCount = 0
@@ -51,6 +53,7 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
         backgroundExecutor = Executors.newSingleThreadExecutor()
 
         setupDelegateSpinner()
+        setupCameraFlip()
 
         if (hasCameraPermission()) {
             startAll()
@@ -117,6 +120,19 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
         }
     }
 
+    // ── Camera flip ───────────────────────────────────────────────────────
+    private fun setupCameraFlip() {
+        binding.btnFlipCamera.setOnClickListener {
+            isFrontCamera = !isFrontCamera
+            // Reset FPS counter on switch
+            frameCount = 0
+            lastFpsTimestamp = SystemClock.uptimeMillis()
+            currentFps = 0
+            binding.overlayView.clear()
+            startCamera()
+        }
+    }
+
     // ── Start helper + camera ────────────────────────────────────────────
     private fun startAll() {
         backgroundExecutor.execute {
@@ -134,33 +150,53 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
+            val provider = cameraProviderFuture.get()
+            cameraProvider = provider
 
-            // 4:3 aspect ratio matching the model (identical to Google demo)
-            val preview = Preview.Builder()
-                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-                .build()
+            // Use full sensor resolution — no aspect ratio constraint
+            val previewBuilder = Preview.Builder()
+
+            // Uncap frame rate — let the device run as fast as possible
+            val previewInterop = Camera2Interop.Extender(previewBuilder)
+            previewInterop.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                Range(15, 300)
+            )
+
+            val preview = previewBuilder.build()
                 .also { it.setSurfaceProvider(binding.previewView.surfaceProvider) }
 
-            val imageAnalysis = ImageAnalysis.Builder()
-                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+            val analysisBuilder = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build()
+
+            // Uncap frame rate on analysis too
+            val analysisInterop = Camera2Interop.Extender(analysisBuilder)
+            analysisInterop.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                Range(15, 300)
+            )
+
+            val cameraSelector = if (isFrontCamera)
+                CameraSelector.DEFAULT_FRONT_CAMERA
+            else
+                CameraSelector.DEFAULT_BACK_CAMERA
+
+            val imageAnalysis = analysisBuilder.build()
                 .also { analysis ->
                     analysis.setAnalyzer(backgroundExecutor) { imageProxy ->
                         poseLandmarkerHelper?.detectLiveStream(
                             imageProxy = imageProxy,
-                            isFrontCamera = false
+                            isFrontCamera = isFrontCamera
                         )
                     }
                 }
 
             try {
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
+                provider.unbindAll()
+                provider.bindToLifecycle(
                     this,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    cameraSelector,
                     preview,
                     imageAnalysis
                 )
