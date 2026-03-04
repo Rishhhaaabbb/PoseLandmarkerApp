@@ -22,6 +22,10 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.example.poselandmarker.databinding.ActivityMainBinding
+import com.example.poselandmarker.posecorrection.FeedbackGenerator
+import com.example.poselandmarker.posecorrection.PoseFeatureExtractor
+import com.example.poselandmarker.posecorrection.PoseGraph
+import com.example.poselandmarker.posecorrection.PoseStateMachine
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -39,6 +43,13 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
     private var frameCount = 0
     private var lastFpsTimestamp = SystemClock.uptimeMillis()
     private var currentFps = 0
+
+    // Pose correction components
+    private var poseGraph: PoseGraph? = null
+    private var poseStateMachine: PoseStateMachine? = null
+    private val featureExtractor = PoseFeatureExtractor()
+    private val feedbackGenerator = FeedbackGenerator()
+    private var poseCorrectionEnabled = true
 
     companion object {
         private const val TAG = "PoseLandmarker"
@@ -135,6 +146,18 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
 
     // ── Start helper + camera ────────────────────────────────────────────
     private fun startAll() {
+        // Load pose graph from assets
+        try {
+            poseGraph = PoseGraph.loadFromAssets(this, "tree.json")
+            poseGraph?.let {
+                poseStateMachine = PoseStateMachine(it)
+                Log.d(TAG, "Loaded pose graph with ${it.states.size} states")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load pose graph: ${e.message}")
+            poseCorrectionEnabled = false
+        }
+
         backgroundExecutor.execute {
             poseLandmarkerHelper = PoseLandmarkerHelper(
                 context = this,
@@ -223,6 +246,37 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
         updateFps()
         val delegateLabel = if (currentDelegate == PoseLandmarkerHelper.DELEGATE_GPU) "GPU" else "CPU"
 
+        // Process pose correction
+        var stateName = ""
+        var repCount = 0
+        var feedback = ""
+        var isMatching = false
+
+        if (poseCorrectionEnabled && poseStateMachine != null) {
+            val landmarks = resultBundle.result.landmarks()
+            if (landmarks.isNotEmpty()) {
+                val features = featureExtractor.extractFeatures(landmarks[0])
+                if (features != null) {
+                    val stateUpdate = poseStateMachine!!.update(features)
+                    stateName = stateUpdate.stateName
+                    repCount = stateUpdate.repCount
+                    isMatching = stateUpdate.isMatching
+
+                    // Generate detailed feedback
+                    val currentState = poseGraph?.getState(stateUpdate.stateId)
+                    feedback = if (currentState != null) {
+                        feedbackGenerator.generateFeedback(
+                            stateUpdate.deviations,
+                            currentState.featureTolerances,
+                            isMatching
+                        )
+                    } else {
+                        stateUpdate.feedback
+                    }
+                }
+            }
+        }
+
         runOnUiThread {
             binding.overlayView.setResults(
                 resultBundle.result,
@@ -230,7 +284,11 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
                 resultBundle.inputImageWidth,
                 currentFps,
                 resultBundle.inferenceTime,
-                delegateLabel
+                delegateLabel,
+                stateName,
+                repCount,
+                feedback,
+                isMatching
             )
         }
     }

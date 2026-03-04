@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.View
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
@@ -30,6 +31,12 @@ class OverlayView @JvmOverloads constructor(
     private var inferenceTimeMs: Long = 0
     private var delegateName: String = "GPU"
 
+    // Pose correction state
+    private var stateName: String = ""
+    private var repCount: Int = 0
+    private var feedback: String = ""
+    private var isMatching: Boolean = false
+
     private val pointPaint = Paint().apply {
         color = Color.YELLOW
         strokeWidth = LANDMARK_STROKE_WIDTH
@@ -37,6 +44,7 @@ class OverlayView @JvmOverloads constructor(
         isAntiAlias = true
     }
 
+    // Dynamic line paint - color changes based on pose matching
     private val linePaint = Paint().apply {
         color = Color.rgb(0, 188, 212) // Cyan/teal matching Google demo
         strokeWidth = LANDMARK_STROKE_WIDTH
@@ -52,13 +60,40 @@ class OverlayView @JvmOverloads constructor(
         setShadowLayer(6f, 2f, 2f, Color.BLACK)
     }
 
+    private val feedbackPaint = Paint().apply {
+        color = Color.WHITE
+        textSize = 64f
+        isAntiAlias = true
+        isFakeBoldText = true
+        setShadowLayer(8f, 2f, 2f, Color.BLACK)
+        textAlign = Paint.Align.CENTER
+    }
+
+    private val statePaint = Paint().apply {
+        color = Color.rgb(76, 175, 80) // Green
+        textSize = 48f
+        isAntiAlias = true
+        isFakeBoldText = true
+        setShadowLayer(6f, 2f, 2f, Color.BLACK)
+    }
+
+    private val badgePaint = Paint().apply {
+        color = Color.argb(180, 0, 0, 0)
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
+
     fun setResults(
         poseLandmarkerResult: PoseLandmarkerResult,
         imgHeight: Int,
         imgWidth: Int,
         currentFps: Int,
         inferenceTime: Long,
-        delegate: String
+        delegate: String,
+        poseStateName: String = "",
+        poseRepCount: Int = 0,
+        poseFeedback: String = "",
+        poseIsMatching: Boolean = false
     ) {
         results = poseLandmarkerResult
         imageHeight = imgHeight
@@ -66,6 +101,17 @@ class OverlayView @JvmOverloads constructor(
         fps = currentFps
         inferenceTimeMs = inferenceTime
         delegateName = delegate
+        stateName = poseStateName
+        repCount = poseRepCount
+        feedback = poseFeedback
+        isMatching = poseIsMatching
+
+        // Update skeleton color based on pose matching
+        linePaint.color = if (isMatching) {
+            Color.rgb(76, 175, 80) // Green when matching
+        } else {
+            Color.rgb(255, 152, 0) // Orange when not matching
+        }
 
         // PreviewView FILL_START mode: scale up to match preview size
         scaleFactor = max(width * 1f / imageWidth, height * 1f / imageHeight)
@@ -76,6 +122,10 @@ class OverlayView @JvmOverloads constructor(
         results = null
         fps = 0
         inferenceTimeMs = 0
+        stateName = ""
+        repCount = 0
+        feedback = ""
+        isMatching = false
         invalidate()
     }
 
@@ -93,6 +143,42 @@ class OverlayView @JvmOverloads constructor(
         canvas.drawText("FPS: $fps", 32f, topOffset, textPaint)
         canvas.drawText("Inference: ${inferenceTimeMs}ms", 32f, topOffset + 60f, textPaint)
         canvas.drawText("Delegate: $delegateName", 32f, topOffset + 120f, textPaint)
+
+        // Draw pose correction state info (top right)
+        if (stateName.isNotEmpty()) {
+            val rightX = width - 32f
+            statePaint.textAlign = Paint.Align.RIGHT
+            canvas.drawText(stateName, rightX, topOffset, statePaint)
+            canvas.drawText("Reps: $repCount", rightX, topOffset + 60f, statePaint)
+        }
+
+        // Draw feedback at bottom center with background badge
+        if (feedback.isNotEmpty()) {
+            val feedbackY = height - 120f
+            val textWidth = feedbackPaint.measureText(feedback)
+            val padding = 24f
+
+            // Draw semi-transparent background
+            val bgRect = RectF(
+                width / 2f - textWidth / 2f - padding,
+                feedbackY - 50f,
+                width / 2f + textWidth / 2f + padding,
+                feedbackY + 20f
+            )
+
+            // Change background color based on matching state
+            badgePaint.color = if (isMatching) {
+                Color.argb(200, 46, 125, 50) // Dark green
+            } else {
+                Color.argb(200, 230, 81, 0) // Dark orange
+            }
+
+            canvas.drawRoundRect(bgRect, 16f, 16f, badgePaint)
+
+            // Draw feedback text
+            feedbackPaint.color = Color.WHITE
+            canvas.drawText(feedback, width / 2f, feedbackY, feedbackPaint)
+        }
 
         val poseLandmarkerResult = results ?: return
         val allLandmarks = poseLandmarkerResult.landmarks()
