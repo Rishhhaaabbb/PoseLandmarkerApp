@@ -10,8 +10,9 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.PoseLandmarker">
 
+        <!-- Exercise selection screen (launcher) -->
         <activity
-            android:name=".MainActivity"
+            android:name=".ExerciseSelectActivity"
             android:exported="true"
             android:screenOrientation="portrait">
             <intent-filter>
@@ -19,6 +20,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Camera / pose correction screen -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
 
     </application>
 </manifest>

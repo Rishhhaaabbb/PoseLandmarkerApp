@@ -91,13 +91,13 @@ class PoseStateMachine(
         return scale
     }
 
-    // ── Accuracy tracking ───────────────────────────────────────────────
-    private var greenFrames: Int = 0
+    // ── Accuracy tracking (ratio-based, not binary) ────────────────────
+    private var matchRatioAccumulator: Float = 0f
     private var evaluatedFrames: Int = 0
 
-    /** Current accuracy percentage [0, 100] */
+    /** Current accuracy percentage [0, 100] based on average match ratio */
     val accuracyPercent: Int get() {
-        return if (evaluatedFrames > 0) ((greenFrames.toFloat() / evaluatedFrames) * 100).toInt() else 0
+        return if (evaluatedFrames > 0) ((matchRatioAccumulator / evaluatedFrames) * 100).toInt().coerceIn(0, 100) else 0
     }
 
     // ── Streak tracking ─────────────────────────────────────────────────
@@ -177,10 +177,10 @@ class PoseStateMachine(
             kotlin.math.abs(signedDev) / scaledTol
         }
 
-        // ── Accuracy tracking ───────────────────────────────────────
+        // ── Accuracy tracking (accumulate match ratio, not binary) ────
         evaluatedFrames++
+        matchRatioAccumulator += bestResult.matchRatio
         if (isInTargetPose) {
-            greenFrames++
             currentStreak++
             if (currentStreak > maxStreak) maxStreak = currentStreak
         } else {
@@ -280,7 +280,7 @@ class PoseStateMachine(
         noMatchStartTimeMs = 0
 
         // Reset accuracy for new state
-        greenFrames = 0
+        matchRatioAccumulator = 0f
         evaluatedFrames = 0
         currentStreak = 0
     }
@@ -322,7 +322,7 @@ class PoseStateMachine(
         wasHoldingLastFrame = false
         lastTransitionTimeMs = 0
         noMatchStartTimeMs = 0
-        greenFrames = 0
+        matchRatioAccumulator = 0f
         evaluatedFrames = 0
         currentStreak = 0
         maxStreak = 0

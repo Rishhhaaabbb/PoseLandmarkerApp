@@ -47,7 +47,7 @@ class PoseLandmarkerHelper(
             DELEGATE_GPU -> baseOptionBuilder.setDelegate(Delegate.GPU)
         }
 
-        baseOptionBuilder.setModelAssetPath("pose_landmarker_full.task")
+        baseOptionBuilder.setModelAssetPath("pose_landmarker_lite.task")
 
         try {
             val baseOptions = baseOptionBuilder.build()
@@ -107,7 +107,18 @@ class PoseLandmarkerHelper(
             matrix, true
         )
 
-        val mpImage = BitmapImageBuilder(rotatedBitmap).build()
+        // Downscale for faster inference (target max dimension ~480px)
+        val maxDim = 480
+        val rw = rotatedBitmap.width
+        val rh = rotatedBitmap.height
+        val scaledBitmap = if (maxOf(rw, rh) > maxDim) {
+            val scale = maxDim.toFloat() / maxOf(rw, rh)
+            Bitmap.createScaledBitmap(rotatedBitmap, (rw * scale).toInt(), (rh * scale).toInt(), true)
+        } else {
+            rotatedBitmap
+        }
+
+        val mpImage = BitmapImageBuilder(scaledBitmap).build()
         poseLandmarker?.detectAsync(mpImage, frameTime)
     }
 
@@ -152,8 +163,8 @@ class PoseLandmarkerHelper(
         const val DELEGATE_GPU = 1
         const val OTHER_ERROR = 0
         const val GPU_ERROR = 1
-        const val DEFAULT_POSE_DETECTION_CONFIDENCE = 0.75F
+        const val DEFAULT_POSE_DETECTION_CONFIDENCE = 0.6F
         const val DEFAULT_POSE_TRACKING_CONFIDENCE = 0.5F
-        const val DEFAULT_POSE_PRESENCE_CONFIDENCE = 0.75F
+        const val DEFAULT_POSE_PRESENCE_CONFIDENCE = 0.6F
     }
 }

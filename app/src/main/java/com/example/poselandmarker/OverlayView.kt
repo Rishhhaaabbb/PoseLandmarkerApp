@@ -145,12 +145,25 @@ class OverlayView @JvmOverloads constructor(
     private val legBones = intArrayOf(23,25, 25,27, 24,26, 26,28)
 
     // Joint index → feature name mapping for per-joint coloring
+    // Extended to cover more joints for better error propagation
     private val jointFeatureMap = mapOf(
         13 to "left_elbow_angle",  14 to "right_elbow_angle",
         25 to "left_knee_angle",   26 to "right_knee_angle",
         11 to "left_shoulder_angle", 12 to "right_shoulder_angle",
         23 to "left_hip_angle",    24 to "right_hip_angle",
-        15 to "left_arm_elevation", 16 to "right_arm_elevation"
+        15 to "left_arm_elevation", 16 to "right_arm_elevation",
+        27 to "left_knee_angle",   28 to "right_knee_angle"    // ankles inherit from knees
+    )
+
+    // Adjacency: for landmarks with no feature, inherit from nearest mapped neighbor
+    private val jointErrorFallback = mapOf(
+        0 to 11,   // nose → left shoulder
+        1 to 11, 2 to 12, 3 to 11, 4 to 12,  // eyes/ears → shoulders
+        5 to 11, 6 to 12, 7 to 13, 8 to 14,  // unused MP indices
+        9 to 15, 10 to 16,
+        17 to 15, 18 to 16, 19 to 15, 20 to 16,  // hand landmarks
+        21 to 15, 22 to 16,
+        29 to 27, 30 to 28, 31 to 27, 32 to 28   // foot landmarks
     )
 
     // ── Public API ──────────────────────────────────────────────────────
@@ -324,8 +337,21 @@ class OverlayView @JvmOverloads constructor(
         if (perJointErrorRatios.isEmpty()) {
             return if (isMatching) 0f else 0.8f
         }
-        val featureName = jointFeatureMap[landmarkIndex] ?: return 0f
-        return perJointErrorRatios[featureName] ?: 0f
+        // Direct mapping first
+        val directFeature = jointFeatureMap[landmarkIndex]
+        if (directFeature != null) {
+            return perJointErrorRatios[directFeature] ?: 0f
+        }
+        // Fallback: inherit from nearest mapped neighbor
+        val fallbackIdx = jointErrorFallback[landmarkIndex]
+        if (fallbackIdx != null) {
+            val fallbackFeature = jointFeatureMap[fallbackIdx]
+            if (fallbackFeature != null) {
+                return perJointErrorRatios[fallbackFeature] ?: 0f
+            }
+        }
+        // Truly unmapped → assume OK
+        return 0f
     }
 
     // ── Top HUD ─────────────────────────────────────────────────────────
@@ -481,35 +507,37 @@ class OverlayView @JvmOverloads constructor(
         val keypoints = currentTargetKeypoints ?: return
         if (keypoints.isEmpty()) return
 
-        val panelW = (width * 0.22f).toInt()
-        val panelH = (height * 0.25f).toInt()
+        // Larger panel for better visibility
+        val panelW = (width * 0.28f).toInt()
+        val panelH = (height * 0.32f).toInt()
         val panelX = width - panelW - (8f * dp).toInt()
-        val panelY = height - panelH - (90f * dp).toInt() // Above bottom controls
+        val panelY = height - panelH - (90f * dp).toInt()
 
         // Semi-transparent panel background
-        badgePaint.color = Color.argb(160, 20, 20, 20)
+        badgePaint.color = Color.argb(180, 15, 15, 15)
         val panelRect = RectF(panelX.toFloat(), panelY.toFloat(),
             (panelX + panelW).toFloat(), (panelY + panelH).toFloat())
-        canvas.drawRoundRect(panelRect, 8f * dp, 8f * dp, badgePaint)
+        canvas.drawRoundRect(panelRect, 10f * dp, 10f * dp, badgePaint)
 
-        // Border
+        // Border colored by match status
         badgePaint.style = Paint.Style.STROKE
         badgePaint.strokeWidth = 1.5f * dp
-        badgePaint.color = Color.argb(120, 200, 200, 200)
-        canvas.drawRoundRect(panelRect, 8f * dp, 8f * dp, badgePaint)
+        badgePaint.color = if (isMatching) Color.argb(140, 76, 175, 80) else Color.argb(120, 200, 200, 200)
+        canvas.drawRoundRect(panelRect, 10f * dp, 10f * dp, badgePaint)
         badgePaint.style = Paint.Style.FILL
 
         // Label
         textPaint.textSize = 10f * dp
-        textPaint.color = Color.argb(200, 200, 200, 200)
+        textPaint.color = Color.argb(220, 220, 220, 220)
         textPaint.textAlign = Paint.Align.CENTER
         canvas.drawText("TARGET POSE", panelX + panelW / 2f, panelY + 14f * dp, textPaint)
         textPaint.textAlign = Paint.Align.LEFT
 
-        // Scale keypoints to fit panel
-        val scaled = scaleKeypointsToPanel(keypoints, panelW, panelH - (20f * dp).toInt(), panelX, panelY + (18f * dp).toInt())
+        // Scale keypoints using BODY-ONLY bounding box (landmarks 11-28)
+        val bodyLabelH = (18f * dp).toInt()
+        val scaled = scaleKeypointsToPanel(keypoints, panelW, panelH - bodyLabelH, panelX, panelY + bodyLabelH, bodyOnly = true)
 
-        // Draw mini skeleton
+        // Draw bones with per-joint error coloring
         val bones = listOf(
             11 to 12, 11 to 23, 12 to 24, 23 to 24,  // torso
             11 to 13, 13 to 15, 12 to 14, 14 to 16,  // arms
@@ -522,26 +550,57 @@ class OverlayView @JvmOverloads constructor(
             val (ex, ey, ec) = scaled[e]
             if (sc < 0.3f || ec < 0.3f) continue
 
-            miniSkeletonPaint.color = Color.rgb(120, 200, 120)
+            // Color based on error ratios for these joints
+            val startErr = getJointErrorRatio(s)
+            val endErr = getJointErrorRatio(e)
+            val maxErr = max(startErr, endErr)
+
+            miniSkeletonPaint.color = when {
+                perJointErrorRatios.isEmpty() -> Color.rgb(120, 200, 120)
+                maxErr > 1.5f -> colorRed
+                maxErr > 1.0f -> colorOrange
+                maxErr > 0.7f -> colorYellow
+                else -> Color.rgb(120, 200, 120)
+            }
             canvas.drawLine(sx, sy, ex, ey, miniSkeletonPaint)
         }
 
-        // Draw mini points
+        // Draw joints with error coloring
         val majorJoints = intArrayOf(11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
         for (i in majorJoints) {
             if (i >= scaled.size) continue
             val (x, y, c) = scaled[i]
             if (c < 0.3f) continue
-            miniPointPaint.color = Color.rgb(150, 220, 150)
-            canvas.drawCircle(x, y, 3f * dp, miniPointPaint)
+
+            val errRatio = getJointErrorRatio(i)
+            miniPointPaint.color = when {
+                perJointErrorRatios.isEmpty() -> Color.rgb(150, 220, 150)
+                errRatio > 1.5f -> colorRed
+                errRatio > 1.0f -> colorOrange
+                errRatio > 0.7f -> colorYellow
+                else -> Color.rgb(150, 220, 150)
+            }
+            val r = if (errRatio > 1.0f) 4.5f * dp else 3.5f * dp
+            canvas.drawCircle(x, y, r, miniPointPaint)
         }
 
         // Draw head circle
         if (scaled.size > 4) {
-            val (nx, ny, nc) = scaled[0] // nose
+            val (nx, ny, nc) = scaled[0]
             if (nc > 0.3f) {
-                miniPointPaint.color = Color.rgb(180, 160, 140)
-                canvas.drawCircle(nx, ny, 6f * dp, miniPointPaint)
+                miniPointPaint.color = Color.rgb(200, 180, 160)
+                canvas.drawCircle(nx, ny, 7f * dp, miniPointPaint)
+                // Neck line from head to midpoint of shoulders
+                if (scaled.size > 12) {
+                    val (lsx, lsy, lsc) = scaled[11]
+                    val (rsx, rsy, rsc) = scaled[12]
+                    if (lsc > 0.3f && rsc > 0.3f) {
+                        val neckX = (lsx + rsx) / 2f
+                        val neckY = (lsy + rsy) / 2f
+                        miniSkeletonPaint.color = Color.rgb(120, 200, 120)
+                        canvas.drawLine(nx, ny, neckX, neckY, miniSkeletonPaint)
+                    }
+                }
             }
         }
     }
@@ -549,9 +608,15 @@ class OverlayView @JvmOverloads constructor(
     private fun scaleKeypointsToPanel(
         keypoints: List<Triple<Float, Float, Float>>,
         panelW: Int, panelH: Int,
-        offsetX: Int, offsetY: Int
+        offsetX: Int, offsetY: Int,
+        bodyOnly: Boolean = false
     ): List<Triple<Float, Float, Float>> {
-        val valid = keypoints.filter { it.third > 0.3f }
+        // If bodyOnly, compute bounding box from landmarks 11-28 only (skip face 0-10)
+        val valid = if (bodyOnly) {
+            keypoints.filterIndexed { i, kp -> i in 11..28 && kp.third > 0.3f }
+        } else {
+            keypoints.filter { it.third > 0.3f }
+        }
         if (valid.isEmpty()) return keypoints.map { Triple(0f, 0f, 0f) }
 
         val minX = valid.minOf { it.first }
@@ -561,14 +626,16 @@ class OverlayView @JvmOverloads constructor(
         val rangeX = (maxX - minX).coerceAtLeast(1f)
         val rangeY = (maxY - minY).coerceAtLeast(1f)
 
-        val padding = 0.12f
+        // Leave room for head above shoulders (add 15% top padding if bodyOnly)
+        val topPad = if (bodyOnly) 0.18f else 0.12f
+        val padding = 0.10f
         val scale = min(
             panelW * (1 - 2 * padding) / rangeX,
-            panelH * (1 - 2 * padding) / rangeY
+            panelH * (1 - padding - topPad) / rangeY
         )
 
         val oX = offsetX + (panelW - rangeX * scale) / 2f
-        val oY = offsetY + (panelH - rangeY * scale) / 2f
+        val oY = offsetY + topPad * panelH + (panelH * (1 - padding - topPad) - rangeY * scale) / 2f
 
         return keypoints.map { (x, y, c) ->
             Triple(
@@ -595,14 +662,14 @@ class OverlayView @JvmOverloads constructor(
     // ── Full-screen Guidance Overlay ────────────────────────────────────
 
     private fun drawGuidanceOverlay(canvas: Canvas) {
-        // White background
-        canvas.drawColor(Color.rgb(245, 245, 245))
+        // Dark translucent overlay (not opaque white)
+        canvas.drawColor(Color.argb(220, 20, 20, 30))
 
         val preview = nextStatePreview ?: return
         val keypoints = preview.meanKeypoints ?: return
 
-        // Draw ghost skeleton scaled to full screen
-        val scaled = scaleKeypointsToPanel(keypoints, width, (height * 0.7f).toInt(), 0, (height * 0.1f).toInt())
+        // Draw ghost skeleton scaled to full screen, body-only bounding box
+        val scaled = scaleKeypointsToPanel(keypoints, width, (height * 0.65f).toInt(), 0, (height * 0.12f).toInt(), bodyOnly = true)
 
         val bones = listOf(
             11 to 12, 11 to 23, 12 to 24, 23 to 24,
@@ -610,20 +677,43 @@ class OverlayView @JvmOverloads constructor(
             23 to 25, 25 to 27, 24 to 26, 26 to 28
         )
 
+        // Draw bones with a glow effect
         for ((s, e) in bones) {
             if (s >= scaled.size || e >= scaled.size) continue
             val (sx, sy, sc) = scaled[s]
             val (ex, ey, ec) = scaled[e]
             if (sc < 0.3f || ec < 0.3f) continue
+
+            // Glow layer
+            guidanceLinePaint.color = Color.argb(50, 76, 175, 80)
+            guidanceLinePaint.strokeWidth = 14f * dp
+            canvas.drawLine(sx, sy, ex, ey, guidanceLinePaint)
+
+            // Main line
+            guidanceLinePaint.color = Color.argb(200, 76, 175, 80)
+            guidanceLinePaint.strokeWidth = 6f * dp
             canvas.drawLine(sx, sy, ex, ey, guidanceLinePaint)
         }
 
-        // Draw head
-        if (scaled.size > 4) {
+        // Reset stroke width
+        guidanceLinePaint.strokeWidth = 8f * dp
+
+        // Draw head with neck
+        if (scaled.size > 12) {
             val (nx, ny, nc) = scaled[0]
+            val (lsx, lsy, lsc) = scaled[11]
+            val (rsx, rsy, rsc) = scaled[12]
             if (nc > 0.3f) {
-                guidancePointPaint.color = Color.argb(180, 80, 80, 80)
-                canvas.drawCircle(nx, ny, 18f * dp, guidancePointPaint)
+                guidancePointPaint.color = Color.argb(180, 76, 175, 80)
+                canvas.drawCircle(nx, ny, 20f * dp, guidancePointPaint)
+                // Neck line
+                if (lsc > 0.3f && rsc > 0.3f) {
+                    val neckX = (lsx + rsx) / 2f
+                    val neckY = (lsy + rsy) / 2f
+                    guidanceLinePaint.color = Color.argb(200, 76, 175, 80)
+                    guidanceLinePaint.strokeWidth = 6f * dp
+                    canvas.drawLine(nx, ny, neckX, neckY, guidanceLinePaint)
+                }
             }
         }
 
@@ -633,30 +723,38 @@ class OverlayView @JvmOverloads constructor(
             if (i >= scaled.size) continue
             val (x, y, c) = scaled[i]
             if (c < 0.3f) continue
-            guidancePointPaint.color = Color.argb(200, 60, 60, 60)
+            // Outer glow
+            guidancePointPaint.color = Color.argb(60, 76, 175, 80)
+            canvas.drawCircle(x, y, 10f * dp, guidancePointPaint)
+            // Inner point
+            guidancePointPaint.color = Color.argb(220, 100, 200, 100)
             canvas.drawCircle(x, y, 5f * dp, guidancePointPaint)
         }
 
         // Title
-        hudPaint.textSize = 24f * dp
+        hudPaint.textSize = 22f * dp
         hudPaint.textAlign = Paint.Align.CENTER
-        hudPaint.color = Color.rgb(60, 60, 60)
-        canvas.drawText("NEXT POSE", width / 2f, height * 0.06f, hudPaint)
+        hudPaint.color = Color.rgb(200, 200, 200)
+        canvas.drawText("GET READY", width / 2f, height * 0.06f, hudPaint)
 
         // State name
         hudPaint.textSize = 16f * dp
-        hudPaint.color = Color.rgb(100, 100, 100)
-        canvas.drawText("Pose ${preview.stateId + 1}", width / 2f, height * 0.06f + 24f * dp, hudPaint)
+        hudPaint.color = Color.rgb(76, 175, 80)
+        canvas.drawText("Next: Pose ${preview.stateId + 1}", width / 2f, height * 0.06f + 26f * dp, hudPaint)
 
-        // Countdown
-        hudPaint.textSize = 28f * dp
-        hudPaint.color = Color.rgb(40, 40, 40)
+        // Countdown - large centered
+        hudPaint.textSize = 48f * dp
+        hudPaint.color = colorWhite
         canvas.drawText(
-            String.format("Starting in %.1fs", guidanceRemainingSeconds),
+            String.format("%.0f", guidanceRemainingSeconds),
             width / 2f,
-            height * 0.92f,
+            height * 0.88f,
             hudPaint
         )
+
+        hudPaint.textSize = 14f * dp
+        hudPaint.color = Color.rgb(160, 160, 160)
+        canvas.drawText("seconds", width / 2f, height * 0.88f + 22f * dp, hudPaint)
     }
 
     // ── Utility ─────────────────────────────────────────────────────────

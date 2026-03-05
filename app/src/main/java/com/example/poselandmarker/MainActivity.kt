@@ -144,16 +144,20 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
 
     // ── Start helper + camera ────────────────────────────────────────────
     private fun startAll() {
-        // Load pose graph from assets
+        // Load pose graph from intent extra (exercise file path in assets)
+        val exerciseFile = intent.getStringExtra("exercise_file") ?: "tree.json"
+        val exerciseName = intent.getStringExtra("exercise_name") ?: "Tree Pose"
+        title = exerciseName
+
         try {
-            poseGraph = PoseGraph.loadFromAssets(this, "tree.json")
+            poseGraph = PoseGraph.loadFromAssets(this, exerciseFile)
             poseGraph?.let {
                 poseStateMachine = PoseStateMachine(
                     graph = it,
                     enableAdaptive = true,
                     enablePreview = true
                 )
-                Log.d(TAG, "Loaded pose graph: ${it.states.size} states, " +
+                Log.d(TAG, "Loaded pose graph '$exerciseName': ${it.states.size} states, " +
                         "temporal_seq=${it.metadata.temporalSequence}, " +
                         "base_tol_multiplier=${it.baseToleranceMultiplier}")
             }
