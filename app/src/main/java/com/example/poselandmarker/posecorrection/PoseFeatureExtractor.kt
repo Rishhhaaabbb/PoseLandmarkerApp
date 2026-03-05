@@ -261,4 +261,21 @@ class PoseFeatureExtractor(
         val centerY = (leftHip.y() + rightHip.y() + leftShoulder.y() + rightShoulder.y()) / 4f
         return centerY / bodyScale
     }
+
+    /**
+     * Returns a mirrored (left↔right swapped) version of the given feature map.
+     * This is needed for front-camera because MediaPipe sees mirrored left/right.
+     */
+    fun mirrorFeatures(features: Map<String, Float>): Map<String, Float> {
+        val mirrored = mutableMapOf<String, Float>()
+        for ((key, value) in features) {
+            val mirroredKey = when {
+                key.startsWith("left_") -> key.replaceFirst("left_", "right_")
+                key.startsWith("right_") -> key.replaceFirst("right_", "left_")
+                else -> key
+            }
+            mirrored[mirroredKey] = value
+        }
+        return mirrored
+    }
 }

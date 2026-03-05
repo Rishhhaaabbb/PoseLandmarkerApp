@@ -12,7 +12,7 @@
         android:layout_height="match_parent"
         app:scaleType="fillStart" />
 
-    <!-- Pose overlay (landmarks + skeleton + FPS + inference time) -->
+    <!-- Pose overlay (landmarks + skeleton + full HUD) -->
     <com.example.poselandmarker.OverlayView
         android:id="@+id/overlayView"
         android:layout_width="match_parent"
@@ -21,11 +21,11 @@
     <!-- Camera flip button (top-right, below status bar) -->
     <ImageButton
         android:id="@+id/btnFlipCamera"
-        android:layout_width="56dp"
-        android:layout_height="56dp"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
         android:layout_gravity="top|end"
         android:layout_marginTop="40dp"
-        android:layout_marginEnd="16dp"
+        android:layout_marginEnd="12dp"
         android:background="@android:color/transparent"
         android:src="@android:drawable/ic_menu_camera"
         android:contentDescription="Switch camera"
@@ -33,29 +33,30 @@
         android:scaleType="fitCenter"
         app:tint="@android:color/white" />
 
-    <!-- Bottom controls: Delegate selector -->
+    <!-- Delegate selector — small pill bottom-left, out of the way -->
     <LinearLayout
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="bottom|center_horizontal"
+        android:layout_gravity="bottom|start"
         android:orientation="horizontal"
-        android:padding="12dp"
-        android:layout_marginBottom="24dp"
-        android:background="#AA000000"
+        android:padding="8dp"
+        android:layout_marginBottom="16dp"
+        android:layout_marginStart="8dp"
+        android:background="#66000000"
         android:gravity="center_vertical">
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="Delegate:"
-            android:textColor="@android:color/white"
-            android:textSize="16sp"
-            android:layout_marginEnd="8dp" />
+            android:textColor="#AAFFFFFF"
+            android:textSize="12sp"
+            android:layout_marginEnd="4dp" />
 
         <Spinner
             android:id="@+id/spinnerDelegate"
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:layout_height="28dp"
             android:backgroundTint="@android:color/white"
             android:popupBackground="#333333" />
 

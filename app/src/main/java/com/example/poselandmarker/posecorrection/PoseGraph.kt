@@ -1,7 +1,6 @@
 package com.example.poselandmarker.posecorrection
 
 import android.content.Context
-import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.abs
 
@@ -13,48 +12,53 @@ data class PoseState(
     val meanFeatures: Map<String, Float>,
     val featureTolerances: Map<String, Float>,
     val minHoldDuration: Float,
-    val meanKeypoints: List<Pair<Float, Float>>? = null
+    val meanKeypoints: List<Triple<Float, Float, Float>>? = null // x, y, confidence
 ) {
     /**
-     * Check if given features match this state within tolerances.
-     * @param features Feature dictionary to check
-     * @param strict If true, all features must match. If false, allow partial match (60%)
-     * @return Pair of (matches, deviations map)
+     * Check if given features match this state within scaled tolerances.
+     * @param features  Feature dictionary to check
+     * @param toleranceScale  Multiplier applied to all tolerances (for progressive relaxation)
+     * @param matchThreshold  Fraction of features that must be within tolerance (default 0.6)
+     * @return MatchResult with match status, signed deviations, and match ratio
      */
-    fun matches(features: Map<String, Float>, strict: Boolean = false): Pair<Boolean, Map<String, Float>> {
+    fun matches(
+        features: Map<String, Float>,
+        toleranceScale: Float = 1.0f,
+        matchThreshold: Float = 0.6f
+    ): MatchResult {
         val deviations = mutableMapOf<String, Float>()
         var matchesCount = 0
         var totalCount = 0
 
         for ((featureName, meanVal) in meanFeatures) {
-            val currentVal = features[featureName] ?: if (strict) return Pair(false, emptyMap()) else continue
+            val currentVal = features[featureName] ?: continue
 
             totalCount++
-            val tolerance = featureTolerances[featureName] ?: 10f
-            val deviation = abs(currentVal - meanVal)
-            deviations[featureName] = deviation
+            val baseTolerance = featureTolerances[featureName] ?: 10f
+            val scaledTolerance = baseTolerance * toleranceScale
+            val signedDeviation = currentVal - meanVal // Signed for direction feedback
+            deviations[featureName] = signedDeviation
 
-            if (deviation <= tolerance) {
+            if (abs(signedDeviation) <= scaledTolerance) {
                 matchesCount++
             }
         }
 
-        if (totalCount == 0) return Pair(false, emptyMap())
+        if (totalCount == 0) return MatchResult(false, emptyMap(), 0f)
 
-        val matches = if (strict) {
-            matchesCount == totalCount
-        } else {
-            matchesCount.toFloat() / totalCount >= 0.6f
-        }
-
-        return Pair(matches, deviations)
+        val ratio = matchesCount.toFloat() / totalCount
+        return MatchResult(
+            isMatch = ratio >= matchThreshold,
+            deviations = deviations,
+            matchRatio = ratio
+        )
     }
 
     companion object {
         fun fromJson(json: JSONObject): PoseState {
             val meanFeatures = mutableMapOf<String, Float>()
             val tolerances = mutableMapOf<String, Float>()
-            var keypoints: List<Pair<Float, Float>>? = null
+            var keypoints: List<Triple<Float, Float, Float>>? = null
 
             val meanFeaturesJson = json.getJSONObject("mean_features")
             for (key in meanFeaturesJson.keys()) {
@@ -70,7 +74,11 @@ data class PoseState(
                 val kpArray = json.getJSONArray("mean_keypoints")
                 keypoints = (0 until kpArray.length()).map { i ->
                     val point = kpArray.getJSONArray(i)
-                    Pair(point.getDouble(0).toFloat(), point.getDouble(1).toFloat())
+                    Triple(
+                        point.getDouble(0).toFloat(),
+                        point.getDouble(1).toFloat(),
+                        if (point.length() > 2) point.getDouble(2).toFloat() else 1f
+                    )
                 }
             }
 
@@ -86,23 +94,48 @@ data class PoseState(
 }
 
 /**
- * Directed graph of pose states and their transitions.
+ * Result of matching features against a PoseState.
+ */
+data class MatchResult(
+    val isMatch: Boolean,
+    val deviations: Map<String, Float>,  // Signed deviations (positive = over target, negative = under)
+    val matchRatio: Float                // Fraction of features within tolerance [0, 1]
+)
+
+/**
+ * Directed graph of pose states with temporal sequence and exercise metadata.
  */
 data class PoseGraph(
     val states: List<PoseState>,
-    val transitions: Map<Int, List<Int>>,  // state_id -> [next_state_ids]
+    val transitions: Map<Int, List<Int>>,
     val metadata: GraphMetadata
 ) {
+    /** Auto-computed base tolerance multiplier for tight-tolerance graphs */
+    val baseToleranceMultiplier: Float by lazy { computeBaseMultiplier() }
+
     fun getState(stateId: Int): PoseState? = states.find { it.stateId == stateId }
 
     fun getNextStates(currentStateId: Int): List<Int> = transitions[currentStateId] ?: emptyList()
 
     fun getStartState(): PoseState? = states.firstOrNull()
 
+    /**
+     * If average tolerance across all states is very low, apply a base multiplier
+     * to make the graph more forgiving (like Python's ExerciseComplexityAnalyzer).
+     */
+    private fun computeBaseMultiplier(): Float {
+        if (states.isEmpty()) return 1.0f
+        val avgTolerance = states.flatMap { it.featureTolerances.values }
+            .average().toFloat()
+        return when {
+            avgTolerance < 3f  -> 1.8f  // Extremely tight
+            avgTolerance < 5f  -> 1.5f  // Very tight
+            avgTolerance < 8f  -> 1.2f  // Moderately tight
+            else -> 1.0f
+        }
+    }
+
     companion object {
-        /**
-         * Load a pose graph from a JSON file in the assets folder.
-         */
         fun loadFromAssets(context: Context, filename: String): PoseGraph {
             val jsonStr = context.assets.open(filename).bufferedReader().use { it.readText() }
             return fromJson(JSONObject(jsonStr))
@@ -110,11 +143,22 @@ data class PoseGraph(
 
         fun fromJson(json: JSONObject): PoseGraph {
             val metadataJson = json.getJSONObject("metadata")
+
+            // Parse temporal_sequence
+            val temporalSequence = mutableListOf<Int>()
+            if (metadataJson.has("temporal_sequence")) {
+                val seqArr = metadataJson.getJSONArray("temporal_sequence")
+                for (i in 0 until seqArr.length()) {
+                    temporalSequence.add(seqArr.getInt(i))
+                }
+            }
+
             val metadata = GraphMetadata(
                 videoPath = metadataJson.optString("video_path", ""),
                 fps = metadataJson.optDouble("fps", 30.0).toFloat(),
                 numStates = metadataJson.optInt("num_states", 0),
-                createdAt = metadataJson.optString("created_at", "")
+                createdAt = metadataJson.optString("created_at", ""),
+                temporalSequence = temporalSequence
             )
 
             val statesJson = json.getJSONArray("states")
@@ -143,5 +187,6 @@ data class GraphMetadata(
     val videoPath: String,
     val fps: Float,
     val numStates: Int,
-    val createdAt: String
+    val createdAt: String,
+    val temporalSequence: List<Int> = emptyList()
 )

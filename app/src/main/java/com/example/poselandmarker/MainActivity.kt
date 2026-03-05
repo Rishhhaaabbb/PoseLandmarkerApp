@@ -36,7 +36,7 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
     private var poseLandmarkerHelper: PoseLandmarkerHelper? = null
 
     private var currentDelegate = PoseLandmarkerHelper.DELEGATE_GPU
-    private var isFrontCamera = true // Start with front camera
+    private var isFrontCamera = true
     private var cameraProvider: ProcessCameraProvider? = null
 
     // FPS tracking
@@ -118,7 +118,6 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
             ) {
                 if (position != currentDelegate) {
                     currentDelegate = position
-                    // Reinitialize on the background thread
                     backgroundExecutor.execute {
                         poseLandmarkerHelper?.clearPoseLandmarker()
                         poseLandmarkerHelper?.currentDelegate = currentDelegate
@@ -135,7 +134,6 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
     private fun setupCameraFlip() {
         binding.btnFlipCamera.setOnClickListener {
             isFrontCamera = !isFrontCamera
-            // Reset FPS counter on switch
             frameCount = 0
             lastFpsTimestamp = SystemClock.uptimeMillis()
             currentFps = 0
@@ -150,8 +148,14 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
         try {
             poseGraph = PoseGraph.loadFromAssets(this, "tree.json")
             poseGraph?.let {
-                poseStateMachine = PoseStateMachine(it)
-                Log.d(TAG, "Loaded pose graph with ${it.states.size} states")
+                poseStateMachine = PoseStateMachine(
+                    graph = it,
+                    enableAdaptive = true,
+                    enablePreview = true
+                )
+                Log.d(TAG, "Loaded pose graph: ${it.states.size} states, " +
+                        "temporal_seq=${it.metadata.temporalSequence}, " +
+                        "base_tol_multiplier=${it.baseToleranceMultiplier}")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load pose graph: ${e.message}")
@@ -176,14 +180,13 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
             val provider = cameraProviderFuture.get()
             cameraProvider = provider
 
-            // Use full sensor resolution — no aspect ratio constraint
             val previewBuilder = Preview.Builder()
 
-            // Uncap frame rate — let the device run as fast as possible
+            // Target 30 FPS for stability (not uncapped)
             val previewInterop = Camera2Interop.Extender(previewBuilder)
             previewInterop.setCaptureRequestOption(
                 CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                Range(15, 300)
+                Range(15, 30)
             )
 
             val preview = previewBuilder.build()
@@ -193,11 +196,10 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
 
-            // Uncap frame rate on analysis too
             val analysisInterop = Camera2Interop.Extender(analysisBuilder)
             analysisInterop.setCaptureRequestOption(
                 CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                Range(15, 300)
+                Range(15, 30)
             )
 
             val cameraSelector = if (isFrontCamera)
@@ -244,34 +246,64 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
     // ── LandmarkerListener callbacks ─────────────────────────────────────
     override fun onResults(resultBundle: PoseLandmarkerHelper.ResultBundle) {
         updateFps()
-        val delegateLabel = if (currentDelegate == PoseLandmarkerHelper.DELEGATE_GPU) "GPU" else "CPU"
 
         // Process pose correction
         var stateName = ""
+        var sequenceProgress = ""
         var repCount = 0
         var feedback = ""
         var isMatching = false
+        var holdProgress = 0f
+        var holdRemainingSeconds = 0f
+        var accuracyPercent = 0
+        var matchRatio = 0f
+        var streak = 0
+        var isInGracePeriod = false
+        var isGuidanceActive = false
+        var guidanceRemainingSeconds = 0f
+        var nextStatePreview: com.example.poselandmarker.posecorrection.PoseState? = null
+        var currentTargetKeypoints: List<Triple<Float, Float, Float>>? = null
+        var perJointErrorRatios: Map<String, Float> = emptyMap()
 
         if (poseCorrectionEnabled && poseStateMachine != null) {
             val landmarks = resultBundle.result.landmarks()
             if (landmarks.isNotEmpty()) {
                 val features = featureExtractor.extractFeatures(landmarks[0])
                 if (features != null) {
-                    val stateUpdate = poseStateMachine!!.update(features)
+                    // Create mirrored features for front-camera L/R swap
+                    val mirrored = if (isFrontCamera) featureExtractor.mirrorFeatures(features) else null
+
+                    val stateUpdate = poseStateMachine!!.update(features, mirrored)
+
                     stateName = stateUpdate.stateName
+                    sequenceProgress = stateUpdate.sequenceProgress
                     repCount = stateUpdate.repCount
                     isMatching = stateUpdate.isMatching
+                    holdProgress = stateUpdate.holdProgress
+                    holdRemainingSeconds = stateUpdate.holdRemainingSeconds
+                    accuracyPercent = stateUpdate.accuracyPercent
+                    matchRatio = stateUpdate.matchRatio
+                    streak = stateUpdate.streak
+                    isInGracePeriod = stateUpdate.isInGracePeriod
+                    isGuidanceActive = stateUpdate.isGuidanceActive
+                    guidanceRemainingSeconds = stateUpdate.guidanceRemainingSeconds
+                    nextStatePreview = stateUpdate.nextStatePreview
+                    currentTargetKeypoints = stateUpdate.currentTargetKeypoints
+                    perJointErrorRatios = stateUpdate.perJointErrorRatios
 
-                    // Generate detailed feedback
+                    // Generate detailed feedback (debounced)
                     val currentState = poseGraph?.getState(stateUpdate.stateId)
-                    feedback = if (currentState != null) {
+                    feedback = if (stateUpdate.feedback.isNotEmpty()) {
+                        stateUpdate.feedback
+                    } else if (currentState != null) {
                         feedbackGenerator.generateFeedback(
                             stateUpdate.deviations,
                             currentState.featureTolerances,
+                            stateUpdate.toleranceScale,
                             isMatching
                         )
                     } else {
-                        stateUpdate.feedback
+                        ""
                     }
                 }
             }
@@ -279,16 +311,27 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
 
         runOnUiThread {
             binding.overlayView.setResults(
-                resultBundle.result,
-                resultBundle.inputImageHeight,
-                resultBundle.inputImageWidth,
-                currentFps,
-                resultBundle.inferenceTime,
-                delegateLabel,
-                stateName,
-                repCount,
-                feedback,
-                isMatching
+                poseLandmarkerResult = resultBundle.result,
+                imgHeight = resultBundle.inputImageHeight,
+                imgWidth = resultBundle.inputImageWidth,
+                currentFps = currentFps,
+                inferenceTime = resultBundle.inferenceTime,
+                poseStateName = stateName,
+                poseSequenceProgress = sequenceProgress,
+                poseRepCount = repCount,
+                poseFeedback = feedback,
+                poseIsMatching = isMatching,
+                poseHoldProgress = holdProgress,
+                poseHoldRemainingSeconds = holdRemainingSeconds,
+                poseAccuracyPercent = accuracyPercent,
+                poseMatchRatio = matchRatio,
+                poseStreak = streak,
+                poseIsInGracePeriod = isInGracePeriod,
+                poseIsGuidanceActive = isGuidanceActive,
+                poseGuidanceRemainingSeconds = guidanceRemainingSeconds,
+                poseNextStatePreview = nextStatePreview,
+                poseCurrentTargetKeypoints = currentTargetKeypoints,
+                posePerJointErrorRatios = perJointErrorRatios
             )
         }
     }
@@ -297,7 +340,6 @@ class MainActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListene
         runOnUiThread {
             Toast.makeText(this, error, Toast.LENGTH_SHORT).show()
             if (errorCode == PoseLandmarkerHelper.GPU_ERROR) {
-                // Auto-fallback to CPU
                 currentDelegate = PoseLandmarkerHelper.DELEGATE_CPU
                 binding.spinnerDelegate.setSelection(PoseLandmarkerHelper.DELEGATE_CPU)
                 backgroundExecutor.execute {

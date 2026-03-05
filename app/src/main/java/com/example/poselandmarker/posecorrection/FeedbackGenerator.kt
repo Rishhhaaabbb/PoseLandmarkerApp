@@ -1,111 +1,139 @@
 package com.example.poselandmarker.posecorrection
 
+import android.os.SystemClock
 import kotlin.math.abs
 
 /**
- * Generates human-readable feedback based on pose deviations.
+ * Generates human-readable feedback with debouncing (minimum display time)
+ * and intelligent prioritization of core body parts.
+ *
+ * Ported from Python's EnhancedFeedbackGenerator.
  */
-class FeedbackGenerator {
-
-    private val recentFeedback = mutableListOf<String>()
-    private val maxHistory = 3
+class FeedbackGenerator(
+    private val minDisplayTimeMs: Long = 1800,   // Minimum time to show each feedback
+    private val maxHistory: Int = 3
+) {
+    private val recentFeedbackFeatures = mutableListOf<String>()
+    private var currentFeedbackText: String = ""
+    private var lastFeedbackChangeTimeMs: Long = 0
 
     /**
-     * Generate feedback text based on current deviations from target pose.
-     * Prioritizes core body parts and avoids repeating the same feedback.
+     * Generate feedback text based on current SIGNED deviations from target pose.
+     * Uses debouncing — won't change text faster than [minDisplayTimeMs].
+     *
+     * @param deviations  Signed deviations (current - mean): positive = over, negative = under
+     * @param tolerances  Per-feature tolerance values
+     * @param toleranceScale  Current effective tolerance scale (for scaling thresholds)
+     * @param isMatching  True if the pose is currently matching the target
+     * @return Feedback string to display
      */
     fun generateFeedback(
         deviations: Map<String, Float>,
         tolerances: Map<String, Float>,
+        toleranceScale: Float = 1f,
         isMatching: Boolean
     ): String {
+        val now = SystemClock.uptimeMillis()
+
         if (isMatching) {
-            recentFeedback.clear()
-            return "Perfect! Hold this pose"
+            // Always show positive feedback immediately
+            recentFeedbackFeatures.clear()
+            updateFeedback("Perfect! Hold this pose", now)
+            return currentFeedbackText
+        }
+
+        // Debounce — don't change text too fast
+        if (now - lastFeedbackChangeTimeMs < minDisplayTimeMs && currentFeedbackText.isNotEmpty()) {
+            return currentFeedbackText
         }
 
         if (deviations.isEmpty()) {
-            return "Move into frame"
+            updateFeedback("Move into frame", now)
+            return currentFeedbackText
         }
 
-        // Find features exceeding their tolerance
-        val outOfTolerance = deviations.filter { (feature, deviation) ->
-            val tolerance = tolerances[feature] ?: 10f
-            deviation > tolerance
+        // Find features exceeding their scaled tolerance
+        val outOfTolerance = deviations.filter { (feature, signedDev) ->
+            val tolerance = (tolerances[feature] ?: 10f) * toleranceScale
+            abs(signedDev) > tolerance
         }
 
         if (outOfTolerance.isEmpty()) {
-            return "Almost there - minor adjustments"
+            updateFeedback("Almost there — minor adjustments", now)
+            return currentFeedbackText
         }
 
         // Prioritize core body parts
-        val coreFeatures = listOf("hip", "knee", "elbow", "torso", "shoulder")
+        val coreKeywords = listOf("hip", "knee", "elbow", "torso", "shoulder")
         val coreDeviations = outOfTolerance.filter { (feature, _) ->
-            coreFeatures.any { feature.contains(it) }
+            coreKeywords.any { feature.contains(it) }
         }
-
         val targetDeviations = coreDeviations.ifEmpty { outOfTolerance }
 
-        // Get the worst deviation that wasn't recently addressed
-        val sortedDeviations = targetDeviations.entries
-            .sortedByDescending { it.value }
-            .filter { !recentFeedback.contains(it.key) }
+        // Pick worst deviation that wasn't recently addressed
+        val sorted = targetDeviations.entries
+            .sortedByDescending { abs(it.value) }
+            .filter { !recentFeedbackFeatures.contains(it.key) }
 
-        val (worstFeature, worstDeviation) = if (sortedDeviations.isNotEmpty()) {
-            sortedDeviations.first().toPair()
+        val (worstFeature, worstSignedDev) = if (sorted.isNotEmpty()) {
+            sorted.first().toPair()
         } else {
-            // All were recent - just use the worst
-            targetDeviations.maxByOrNull { it.value }?.toPair() ?: return "Adjust pose"
+            targetDeviations.maxByOrNull { abs(it.value) }?.toPair()
+                ?: return currentFeedbackText
         }
 
         // Track this feedback
-        recentFeedback.add(worstFeature)
-        if (recentFeedback.size > maxHistory) {
-            recentFeedback.removeAt(0)
+        recentFeedbackFeatures.add(worstFeature)
+        if (recentFeedbackFeatures.size > maxHistory) {
+            recentFeedbackFeatures.removeAt(0)
         }
 
-        return generateSpecificFeedback(worstFeature, worstDeviation)
+        val text = generateSpecificFeedback(worstFeature, worstSignedDev)
+        updateFeedback(text, now)
+        return currentFeedbackText
     }
 
-    private fun generateSpecificFeedback(featureName: String, deviation: Float): String {
-        val direction = if (deviation > 0) "more" else "less"
+    private fun updateFeedback(text: String, now: Long) {
+        if (text != currentFeedbackText) {
+            currentFeedbackText = text
+            lastFeedbackChangeTimeMs = now
+        }
+    }
 
+    private fun generateSpecificFeedback(featureName: String, signedDeviation: Float): String {
         return when {
             featureName.contains("elbow") -> {
                 val side = if (featureName.contains("left")) "left" else "right"
-                if (deviation > 0) "Straighten $side arm more" else "Bend $side elbow deeper"
+                if (signedDeviation > 0) "Straighten $side arm more" else "Bend $side elbow deeper"
             }
 
             featureName.contains("knee") -> {
                 val side = if (featureName.contains("left")) "left" else "right"
-                if (deviation > 0) "Straighten $side leg" else "Bend $side knee more"
+                if (signedDeviation > 0) "Straighten $side leg" else "Bend $side knee more"
             }
 
             featureName.contains("hip") -> {
-                if (abs(deviation) > 15) {
-                    "Adjust hip angle"
-                } else {
-                    "Fine-tune hip position"
-                }
+                if (signedDeviation > 0) "Hinge forward at hips more" else "Straighten hips, stand taller"
             }
 
             featureName.contains("shoulder") -> {
                 val side = if (featureName.contains("left")) "left" else "right"
-                "Adjust $side shoulder position"
+                if (signedDeviation > 0) "Raise $side arm higher" else "Lower $side arm"
             }
 
             featureName.contains("torso") -> {
-                if (deviation > 0) "Lean forward slightly" else "Stand more upright"
+                if (signedDeviation > 0) "Lean torso forward slightly" else "Bring torso more upright"
             }
 
             featureName.contains("arm_elevation") -> {
                 val side = if (featureName.contains("left")) "left" else "right"
-                if (deviation > 0) "Raise $side arm higher" else "Lower $side arm"
+                // Positive deviation = arm higher than target
+                if (signedDeviation > 0) "Lower $side arm slightly" else "Raise $side arm higher"
             }
 
             featureName.contains("leg_spread") -> {
                 val side = if (featureName.contains("left")) "left" else "right"
-                if (deviation > 0) "Bring $side foot closer" else "Spread $side leg wider"
+                if (signedDeviation > 0) "Bring $side foot closer" else "Spread $side leg wider"
             }
 
             featureName.contains("body_center") -> {
@@ -116,10 +144,9 @@ class FeedbackGenerator {
         }
     }
 
-    /**
-     * Clear feedback history (e.g., when transitioning to a new state).
-     */
     fun clearHistory() {
-        recentFeedback.clear()
+        recentFeedbackFeatures.clear()
+        currentFeedbackText = ""
+        lastFeedbackChangeTimeMs = 0
     }
 }

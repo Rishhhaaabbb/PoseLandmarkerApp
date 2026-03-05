@@ -1,19 +1,25 @@
 package com.example.poselandmarker
 
 import android.content.Context
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.RectF
+import android.graphics.*
 import android.util.AttributeSet
 import android.view.View
+import com.example.poselandmarker.posecorrection.PoseState
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
+import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 
 /**
- * Draws pose landmarks and skeleton connections identical to Google's official demo.
- * Uses PoseLandmarker.POSE_LANDMARKS for connections and proper scaleFactor.
+ * Production-quality overlay that draws:
+ *  - Color-coded skeleton (per-joint deviation highlighting)
+ *  - Top HUD: status bar with state, reps, accuracy gauge, streak
+ *  - Hold timer progress arc
+ *  - Feedback badge (debounced, positioned above bottom controls)
+ *  - Mini target-skeleton panel (bottom-right corner)
+ *  - Full-screen guidance/preview overlay when transitioning
+ *  - FPS counter (small, top-left corner)
  */
 class OverlayView @JvmOverloads constructor(
     context: Context,
@@ -21,6 +27,7 @@ class OverlayView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
+    // ── Input data ──────────────────────────────────────────────────────
     private var results: PoseLandmarkerResult? = null
     private var scaleFactor: Float = 1f
     private var imageWidth: Int = 1
@@ -29,59 +36,124 @@ class OverlayView @JvmOverloads constructor(
     // Metrics
     private var fps: Int = 0
     private var inferenceTimeMs: Long = 0
-    private var delegateName: String = "GPU"
 
     // Pose correction state
     private var stateName: String = ""
+    private var sequenceProgress: String = ""
     private var repCount: Int = 0
     private var feedback: String = ""
     private var isMatching: Boolean = false
+    private var holdProgress: Float = 0f
+    private var holdRemainingSeconds: Float = 0f
+    private var accuracyPercent: Int = 0
+    private var matchRatio: Float = 0f
+    private var streak: Int = 0
 
-    private val pointPaint = Paint().apply {
-        color = Color.YELLOW
-        strokeWidth = LANDMARK_STROKE_WIDTH
+    // Grace / Guidance
+    private var isInGracePeriod: Boolean = false
+    private var isGuidanceActive: Boolean = false
+    private var guidanceRemainingSeconds: Float = 0f
+    private var nextStatePreview: PoseState? = null
+
+    // Target keypoints for mini skeleton
+    private var currentTargetKeypoints: List<Triple<Float, Float, Float>>? = null
+
+    // Per-joint error ratios (feature_name → ratio where >1 = over tolerance)
+    private var perJointErrorRatios: Map<String, Float> = emptyMap()
+
+    // ── Paints ──────────────────────────────────────────────────────────
+    private val dp = context.resources.displayMetrics.density
+
+    private val pointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        strokeWidth = 10f * dp / 2.5f
         style = Paint.Style.FILL
-        isAntiAlias = true
     }
 
-    // Dynamic line paint - color changes based on pose matching
-    private val linePaint = Paint().apply {
-        color = Color.rgb(0, 188, 212) // Cyan/teal matching Google demo
-        strokeWidth = LANDMARK_STROKE_WIDTH
+    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        strokeWidth = 4f * dp
         style = Paint.Style.STROKE
-        isAntiAlias = true
+        strokeCap = Paint.Cap.ROUND
     }
 
-    private val textPaint = Paint().apply {
-        color = Color.YELLOW
-        textSize = 52f
-        isAntiAlias = true
-        isFakeBoldText = true
-        setShadowLayer(6f, 2f, 2f, Color.BLACK)
-    }
-
-    private val feedbackPaint = Paint().apply {
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
-        textSize = 64f
-        isAntiAlias = true
-        isFakeBoldText = true
-        setShadowLayer(8f, 2f, 2f, Color.BLACK)
+        textSize = 13f * dp
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        setShadowLayer(3f * dp, 1f, 1f, Color.BLACK)
+    }
+
+    private val hudPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 14f * dp
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        setShadowLayer(4f * dp, 1f, 1f, Color.BLACK)
+    }
+
+    private val feedbackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 17f * dp
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
         textAlign = Paint.Align.CENTER
+        setShadowLayer(5f * dp, 2f, 2f, Color.BLACK)
     }
 
-    private val statePaint = Paint().apply {
-        color = Color.rgb(76, 175, 80) // Green
-        textSize = 48f
-        isAntiAlias = true
-        isFakeBoldText = true
-        setShadowLayer(6f, 2f, 2f, Color.BLACK)
-    }
-
-    private val badgePaint = Paint().apply {
-        color = Color.argb(180, 0, 0, 0)
+    private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        isAntiAlias = true
     }
+
+    private val progressPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 6f * dp
+        strokeCap = Paint.Cap.ROUND
+    }
+
+    private val miniSkeletonPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        strokeWidth = 2.5f * dp
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+
+    private val miniPointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        strokeWidth = 4f * dp
+        style = Paint.Style.FILL
+    }
+
+    private val guidanceLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        strokeWidth = 8f * dp
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        color = Color.argb(180, 50, 50, 50)
+    }
+
+    private val guidancePointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        strokeWidth = 6f * dp
+        style = Paint.Style.FILL
+        color = Color.argb(200, 50, 50, 50)
+    }
+
+    // Colors
+    private val colorGreen = Color.rgb(76, 175, 80)
+    private val colorOrange = Color.rgb(255, 152, 0)
+    private val colorRed = Color.rgb(244, 67, 54)
+    private val colorYellow = Color.rgb(255, 235, 59)
+    private val colorCyan = Color.rgb(0, 188, 212)
+    private val colorWhite = Color.WHITE
+
+    // MediaPipe skeleton bone connections grouped by body region
+    private val torsoBones = intArrayOf(11,12, 11,23, 12,24, 23,24)
+    private val armBones = intArrayOf(11,13, 13,15, 12,14, 14,16)
+    private val legBones = intArrayOf(23,25, 25,27, 24,26, 26,28)
+
+    // Joint index → feature name mapping for per-joint coloring
+    private val jointFeatureMap = mapOf(
+        13 to "left_elbow_angle",  14 to "right_elbow_angle",
+        25 to "left_knee_angle",   26 to "right_knee_angle",
+        11 to "left_shoulder_angle", 12 to "right_shoulder_angle",
+        23 to "left_hip_angle",    24 to "right_hip_angle",
+        15 to "left_arm_elevation", 16 to "right_arm_elevation"
+    )
+
+    // ── Public API ──────────────────────────────────────────────────────
 
     fun setResults(
         poseLandmarkerResult: PoseLandmarkerResult,
@@ -89,31 +161,45 @@ class OverlayView @JvmOverloads constructor(
         imgWidth: Int,
         currentFps: Int,
         inferenceTime: Long,
-        delegate: String,
         poseStateName: String = "",
+        poseSequenceProgress: String = "",
         poseRepCount: Int = 0,
         poseFeedback: String = "",
-        poseIsMatching: Boolean = false
+        poseIsMatching: Boolean = false,
+        poseHoldProgress: Float = 0f,
+        poseHoldRemainingSeconds: Float = 0f,
+        poseAccuracyPercent: Int = 0,
+        poseMatchRatio: Float = 0f,
+        poseStreak: Int = 0,
+        poseIsInGracePeriod: Boolean = false,
+        poseIsGuidanceActive: Boolean = false,
+        poseGuidanceRemainingSeconds: Float = 0f,
+        poseNextStatePreview: PoseState? = null,
+        poseCurrentTargetKeypoints: List<Triple<Float, Float, Float>>? = null,
+        posePerJointErrorRatios: Map<String, Float> = emptyMap()
     ) {
         results = poseLandmarkerResult
         imageHeight = imgHeight
         imageWidth = imgWidth
         fps = currentFps
         inferenceTimeMs = inferenceTime
-        delegateName = delegate
         stateName = poseStateName
+        sequenceProgress = poseSequenceProgress
         repCount = poseRepCount
         feedback = poseFeedback
         isMatching = poseIsMatching
+        holdProgress = poseHoldProgress
+        holdRemainingSeconds = poseHoldRemainingSeconds
+        accuracyPercent = poseAccuracyPercent
+        matchRatio = poseMatchRatio
+        streak = poseStreak
+        isInGracePeriod = poseIsInGracePeriod
+        isGuidanceActive = poseIsGuidanceActive
+        guidanceRemainingSeconds = poseGuidanceRemainingSeconds
+        nextStatePreview = poseNextStatePreview
+        currentTargetKeypoints = poseCurrentTargetKeypoints
+        perJointErrorRatios = posePerJointErrorRatios
 
-        // Update skeleton color based on pose matching
-        linePaint.color = if (isMatching) {
-            Color.rgb(76, 175, 80) // Green when matching
-        } else {
-            Color.rgb(255, 152, 0) // Orange when not matching
-        }
-
-        // PreviewView FILL_START mode: scale up to match preview size
         scaleFactor = max(width * 1f / imageWidth, height * 1f / imageHeight)
         invalidate()
     }
@@ -126,68 +212,45 @@ class OverlayView @JvmOverloads constructor(
         repCount = 0
         feedback = ""
         isMatching = false
+        holdProgress = 0f
+        accuracyPercent = 0
         invalidate()
     }
 
-    /** Get the height of the system status bar so HUD text is drawn below it */
-    private fun getStatusBarHeight(): Int {
-        val resourceId = resources.getIdentifier("status_bar_height", "dimen", "android")
-        return if (resourceId > 0) resources.getDimensionPixelSize(resourceId) else 80
-    }
+    // ── Drawing ─────────────────────────────────────────────────────────
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
-        // HUD: FPS, inference time, delegate — positioned below the system status bar
-        val topOffset = getStatusBarHeight() + 24f
-        canvas.drawText("FPS: $fps", 32f, topOffset, textPaint)
-        canvas.drawText("Inference: ${inferenceTimeMs}ms", 32f, topOffset + 60f, textPaint)
-        canvas.drawText("Delegate: $delegateName", 32f, topOffset + 120f, textPaint)
-
-        // Draw pose correction state info (top right)
-        if (stateName.isNotEmpty()) {
-            val rightX = width - 32f
-            statePaint.textAlign = Paint.Align.RIGHT
-            canvas.drawText(stateName, rightX, topOffset, statePaint)
-            canvas.drawText("Reps: $repCount", rightX, topOffset + 60f, statePaint)
+        // 1) Full-screen guidance overlay (takes over everything)
+        if (isGuidanceActive && nextStatePreview != null) {
+            drawGuidanceOverlay(canvas)
+            return
         }
 
-        // Draw feedback at bottom center with background badge
-        if (feedback.isNotEmpty()) {
-            val feedbackY = height - 120f
-            val textWidth = feedbackPaint.measureText(feedback)
-            val padding = 24f
+        // 2) Draw live skeleton with per-joint coloring
+        drawSkeleton(canvas)
 
-            // Draw semi-transparent background
-            val bgRect = RectF(
-                width / 2f - textWidth / 2f - padding,
-                feedbackY - 50f,
-                width / 2f + textWidth / 2f + padding,
-                feedbackY + 20f
-            )
+        // 3) HUD elements
+        drawTopHud(canvas)
+        drawHoldTimerArc(canvas)
+        drawAccuracyGauge(canvas)
+        drawFeedbackBadge(canvas)
+        drawMiniTargetSkeleton(canvas)
 
-            // Change background color based on matching state
-            badgePaint.color = if (isMatching) {
-                Color.argb(200, 46, 125, 50) // Dark green
-            } else {
-                Color.argb(200, 230, 81, 0) // Dark orange
-            }
+        // 4) Streak indicator
+        if (streak >= 3) drawStreakBadge(canvas)
+    }
 
-            canvas.drawRoundRect(bgRect, 16f, 16f, badgePaint)
+    // ── Skeleton with per-joint error coloring ──────────────────────────
 
-            // Draw feedback text
-            feedbackPaint.color = Color.WHITE
-            canvas.drawText(feedback, width / 2f, feedbackY, feedbackPaint)
-        }
-
+    private fun drawSkeleton(canvas: Canvas) {
         val poseLandmarkerResult = results ?: return
         val allLandmarks = poseLandmarkerResult.landmarks()
         if (allLandmarks.isEmpty()) return
+        val landmarks = allLandmarks[0]
 
-        // Only draw the first detected person
-        val landmark = allLandmarks[0]
-
-        // Filter out false detections via world landmark visibility
+        // Filter out false detections
         val worldLandmarks = poseLandmarkerResult.worldLandmarks()
         if (worldLandmarks.isNotEmpty()) {
             val wl = worldLandmarks[0]
@@ -198,10 +261,33 @@ class OverlayView @JvmOverloads constructor(
             if (visibleCount < 4) return
         }
 
-        // Draw connections using official POSE_LANDMARKS topology
+        // Default skeleton color based on match state
+        val baseColor = when {
+            isInGracePeriod -> colorCyan
+            isMatching -> colorGreen
+            else -> colorOrange
+        }
+
+        // Draw connections using official POSE_LANDMARKS
         PoseLandmarker.POSE_LANDMARKS.forEach { connection ->
-            val startLm = landmark[connection!!.start()]
-            val endLm = landmark[connection.end()]
+            val startIdx = connection!!.start()
+            val endIdx = connection.end()
+            val startLm = landmarks[startIdx]
+            val endLm = landmarks[endIdx]
+
+            // Determine color based on per-joint errors
+            val startError = getJointErrorRatio(startIdx)
+            val endError = getJointErrorRatio(endIdx)
+            val maxError = max(startError, endError)
+
+            linePaint.color = when {
+                isInGracePeriod -> colorCyan
+                maxError > 1.5f -> colorRed
+                maxError > 1.0f -> colorOrange
+                maxError > 0.7f -> colorYellow
+                else -> colorGreen
+            }
+
             canvas.drawLine(
                 startLm.x() * imageWidth * scaleFactor,
                 startLm.y() * imageHeight * scaleFactor,
@@ -211,17 +297,376 @@ class OverlayView @JvmOverloads constructor(
             )
         }
 
-        // Draw landmark points
-        for (normalizedLandmark in landmark) {
-            canvas.drawPoint(
-                normalizedLandmark.x() * imageWidth * scaleFactor,
-                normalizedLandmark.y() * imageHeight * scaleFactor,
-                pointPaint
+        // Draw landmark points with color coding
+        for (i in landmarks.indices) {
+            val lm = landmarks[i]
+            val x = lm.x() * imageWidth * scaleFactor
+            val y = lm.y() * imageHeight * scaleFactor
+            val errorRatio = getJointErrorRatio(i)
+
+            pointPaint.color = when {
+                isInGracePeriod -> colorCyan
+                errorRatio > 1.5f -> colorRed
+                errorRatio > 1.0f -> colorOrange
+                errorRatio > 0.7f -> colorYellow
+                else -> colorGreen
+            }
+
+            val radius = when {
+                errorRatio > 1.0f -> 7f * dp   // Larger for deviating joints
+                else -> 5f * dp
+            }
+            canvas.drawCircle(x, y, radius, pointPaint)
+        }
+    }
+
+    private fun getJointErrorRatio(landmarkIndex: Int): Float {
+        if (perJointErrorRatios.isEmpty()) {
+            return if (isMatching) 0f else 0.8f
+        }
+        val featureName = jointFeatureMap[landmarkIndex] ?: return 0f
+        return perJointErrorRatios[featureName] ?: 0f
+    }
+
+    // ── Top HUD ─────────────────────────────────────────────────────────
+
+    private fun drawTopHud(canvas: Canvas) {
+        val statusBarH = getStatusBarHeight().toFloat()
+        val topY = statusBarH + 12f * dp
+
+        // Left side: FPS (small, unobtrusive)
+        textPaint.textSize = 11f * dp
+        textPaint.color = Color.argb(180, 255, 255, 255)
+        textPaint.textAlign = Paint.Align.LEFT
+        canvas.drawText("$fps FPS · ${inferenceTimeMs}ms", 12f * dp, topY, textPaint)
+
+        // Center: State info
+        if (stateName.isNotEmpty()) {
+            hudPaint.textSize = 15f * dp
+            hudPaint.textAlign = Paint.Align.CENTER
+            hudPaint.color = if (isMatching) colorGreen else colorWhite
+
+            val centerX = width / 2f
+            canvas.drawText(stateName, centerX, topY, hudPaint)
+
+            hudPaint.textSize = 12f * dp
+            hudPaint.color = Color.argb(200, 200, 200, 200)
+            canvas.drawText("Step $sequenceProgress", centerX, topY + 18f * dp, hudPaint)
+        }
+
+        // Right side: Reps
+        hudPaint.textSize = 16f * dp
+        hudPaint.textAlign = Paint.Align.RIGHT
+        hudPaint.color = colorWhite
+        canvas.drawText("Reps: $repCount", width - 12f * dp, topY, hudPaint)
+    }
+
+    // ── Hold Timer Arc ──────────────────────────────────────────────────
+
+    private fun drawHoldTimerArc(canvas: Canvas) {
+        if (holdProgress <= 0.001f && !isMatching) return
+
+        val centerX = width / 2f
+        val centerY = height * 0.15f
+        val radius = 32f * dp
+        val rect = RectF(centerX - radius, centerY - radius, centerX + radius, centerY + radius)
+
+        // Background circle
+        progressPaint.color = Color.argb(60, 255, 255, 255)
+        canvas.drawArc(rect, 0f, 360f, false, progressPaint)
+
+        // Progress arc
+        progressPaint.color = when {
+            holdProgress >= 1f -> colorGreen
+            holdProgress > 0.5f -> colorCyan
+            else -> colorOrange
+        }
+        canvas.drawArc(rect, -90f, holdProgress * 360f, false, progressPaint)
+
+        // Center text: remaining seconds
+        hudPaint.textSize = 14f * dp
+        hudPaint.textAlign = Paint.Align.CENTER
+        hudPaint.color = colorWhite
+        if (holdRemainingSeconds > 0.1f) {
+            canvas.drawText(String.format("%.1f", holdRemainingSeconds), centerX, centerY + 5f * dp, hudPaint)
+        } else if (holdProgress >= 1f) {
+            hudPaint.color = colorGreen
+            canvas.drawText("✓", centerX, centerY + 5f * dp, hudPaint)
+        }
+
+        // Label below
+        hudPaint.textSize = 10f * dp
+        hudPaint.color = Color.argb(180, 255, 255, 255)
+        canvas.drawText("HOLD", centerX, centerY + radius + 14f * dp, hudPaint)
+    }
+
+    // ── Accuracy Gauge ──────────────────────────────────────────────────
+
+    private fun drawAccuracyGauge(canvas: Canvas) {
+        if (accuracyPercent <= 0 && !isMatching) return
+
+        val gaugeX = width - 48f * dp
+        val gaugeY = height * 0.15f
+        val radius = 28f * dp
+        val rect = RectF(gaugeX - radius, gaugeY - radius, gaugeX + radius, gaugeY + radius)
+
+        // Background
+        progressPaint.color = Color.argb(50, 255, 255, 255)
+        progressPaint.strokeWidth = 5f * dp
+        canvas.drawArc(rect, 0f, 360f, false, progressPaint)
+
+        // Accuracy arc
+        progressPaint.color = when {
+            accuracyPercent >= 85 -> colorGreen
+            accuracyPercent >= 70 -> colorCyan
+            accuracyPercent >= 50 -> colorYellow
+            else -> colorOrange
+        }
+        canvas.drawArc(rect, -90f, accuracyPercent * 3.6f, false, progressPaint)
+        progressPaint.strokeWidth = 6f * dp // reset
+
+        // Text in center
+        hudPaint.textSize = 13f * dp
+        hudPaint.textAlign = Paint.Align.CENTER
+        hudPaint.color = colorWhite
+        canvas.drawText("$accuracyPercent%", gaugeX, gaugeY + 5f * dp, hudPaint)
+
+        // Label below
+        hudPaint.textSize = 9f * dp
+        hudPaint.color = Color.argb(180, 255, 255, 255)
+        canvas.drawText("ACC", gaugeX, gaugeY + radius + 12f * dp, hudPaint)
+    }
+
+    // ── Feedback Badge ──────────────────────────────────────────────────
+
+    private fun drawFeedbackBadge(canvas: Canvas) {
+        if (feedback.isEmpty()) return
+
+        // Positioned above the bottom controls (delegate spinner area at ~bottom 80dp)
+        val feedbackY = height - 100f * dp
+        feedbackPaint.textSize = 16f * dp
+        val textW = feedbackPaint.measureText(feedback)
+        val padding = 16f * dp
+
+        val bgRect = RectF(
+            width / 2f - textW / 2f - padding,
+            feedbackY - 28f * dp,
+            width / 2f + textW / 2f + padding,
+            feedbackY + 12f * dp
+        )
+
+        // Background
+        badgePaint.color = when {
+            isInGracePeriod -> Color.argb(200, 0, 150, 136)   // Teal
+            isMatching      -> Color.argb(210, 27, 94, 32)    // Dark green
+            else            -> Color.argb(210, 191, 54, 12)   // Dark orange
+        }
+        canvas.drawRoundRect(bgRect, 12f * dp, 12f * dp, badgePaint)
+
+        // Border
+        badgePaint.style = Paint.Style.STROKE
+        badgePaint.strokeWidth = 2f * dp
+        badgePaint.color = if (isMatching) colorGreen else colorOrange
+        canvas.drawRoundRect(bgRect, 12f * dp, 12f * dp, badgePaint)
+        badgePaint.style = Paint.Style.FILL
+
+        // Text
+        feedbackPaint.color = colorWhite
+        canvas.drawText(feedback, width / 2f, feedbackY, feedbackPaint)
+    }
+
+    // ── Mini Target Skeleton Panel (bottom-right) ───────────────────────
+
+    private fun drawMiniTargetSkeleton(canvas: Canvas) {
+        val keypoints = currentTargetKeypoints ?: return
+        if (keypoints.isEmpty()) return
+
+        val panelW = (width * 0.22f).toInt()
+        val panelH = (height * 0.25f).toInt()
+        val panelX = width - panelW - (8f * dp).toInt()
+        val panelY = height - panelH - (90f * dp).toInt() // Above bottom controls
+
+        // Semi-transparent panel background
+        badgePaint.color = Color.argb(160, 20, 20, 20)
+        val panelRect = RectF(panelX.toFloat(), panelY.toFloat(),
+            (panelX + panelW).toFloat(), (panelY + panelH).toFloat())
+        canvas.drawRoundRect(panelRect, 8f * dp, 8f * dp, badgePaint)
+
+        // Border
+        badgePaint.style = Paint.Style.STROKE
+        badgePaint.strokeWidth = 1.5f * dp
+        badgePaint.color = Color.argb(120, 200, 200, 200)
+        canvas.drawRoundRect(panelRect, 8f * dp, 8f * dp, badgePaint)
+        badgePaint.style = Paint.Style.FILL
+
+        // Label
+        textPaint.textSize = 10f * dp
+        textPaint.color = Color.argb(200, 200, 200, 200)
+        textPaint.textAlign = Paint.Align.CENTER
+        canvas.drawText("TARGET POSE", panelX + panelW / 2f, panelY + 14f * dp, textPaint)
+        textPaint.textAlign = Paint.Align.LEFT
+
+        // Scale keypoints to fit panel
+        val scaled = scaleKeypointsToPanel(keypoints, panelW, panelH - (20f * dp).toInt(), panelX, panelY + (18f * dp).toInt())
+
+        // Draw mini skeleton
+        val bones = listOf(
+            11 to 12, 11 to 23, 12 to 24, 23 to 24,  // torso
+            11 to 13, 13 to 15, 12 to 14, 14 to 16,  // arms
+            23 to 25, 25 to 27, 24 to 26, 26 to 28   // legs
+        )
+
+        for ((s, e) in bones) {
+            if (s >= scaled.size || e >= scaled.size) continue
+            val (sx, sy, sc) = scaled[s]
+            val (ex, ey, ec) = scaled[e]
+            if (sc < 0.3f || ec < 0.3f) continue
+
+            miniSkeletonPaint.color = Color.rgb(120, 200, 120)
+            canvas.drawLine(sx, sy, ex, ey, miniSkeletonPaint)
+        }
+
+        // Draw mini points
+        val majorJoints = intArrayOf(11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
+        for (i in majorJoints) {
+            if (i >= scaled.size) continue
+            val (x, y, c) = scaled[i]
+            if (c < 0.3f) continue
+            miniPointPaint.color = Color.rgb(150, 220, 150)
+            canvas.drawCircle(x, y, 3f * dp, miniPointPaint)
+        }
+
+        // Draw head circle
+        if (scaled.size > 4) {
+            val (nx, ny, nc) = scaled[0] // nose
+            if (nc > 0.3f) {
+                miniPointPaint.color = Color.rgb(180, 160, 140)
+                canvas.drawCircle(nx, ny, 6f * dp, miniPointPaint)
+            }
+        }
+    }
+
+    private fun scaleKeypointsToPanel(
+        keypoints: List<Triple<Float, Float, Float>>,
+        panelW: Int, panelH: Int,
+        offsetX: Int, offsetY: Int
+    ): List<Triple<Float, Float, Float>> {
+        val valid = keypoints.filter { it.third > 0.3f }
+        if (valid.isEmpty()) return keypoints.map { Triple(0f, 0f, 0f) }
+
+        val minX = valid.minOf { it.first }
+        val maxX = valid.maxOf { it.first }
+        val minY = valid.minOf { it.second }
+        val maxY = valid.maxOf { it.second }
+        val rangeX = (maxX - minX).coerceAtLeast(1f)
+        val rangeY = (maxY - minY).coerceAtLeast(1f)
+
+        val padding = 0.12f
+        val scale = min(
+            panelW * (1 - 2 * padding) / rangeX,
+            panelH * (1 - 2 * padding) / rangeY
+        )
+
+        val oX = offsetX + (panelW - rangeX * scale) / 2f
+        val oY = offsetY + (panelH - rangeY * scale) / 2f
+
+        return keypoints.map { (x, y, c) ->
+            Triple(
+                (x - minX) * scale + oX,
+                (y - minY) * scale + oY,
+                c
             )
         }
     }
 
+    // ── Streak Badge ────────────────────────────────────────────────────
+
+    private fun drawStreakBadge(canvas: Canvas) {
+        val badgeX = 12f * dp
+        val badgeY = height * 0.15f
+
+        hudPaint.textSize = 12f * dp
+        hudPaint.textAlign = Paint.Align.LEFT
+        hudPaint.color = if (streak >= 10) colorGreen else colorYellow
+        val streakText = if (streak >= 10) "🔥 STREAK: $streak" else "Streak: $streak"
+        canvas.drawText(streakText, badgeX, badgeY, hudPaint)
+    }
+
+    // ── Full-screen Guidance Overlay ────────────────────────────────────
+
+    private fun drawGuidanceOverlay(canvas: Canvas) {
+        // White background
+        canvas.drawColor(Color.rgb(245, 245, 245))
+
+        val preview = nextStatePreview ?: return
+        val keypoints = preview.meanKeypoints ?: return
+
+        // Draw ghost skeleton scaled to full screen
+        val scaled = scaleKeypointsToPanel(keypoints, width, (height * 0.7f).toInt(), 0, (height * 0.1f).toInt())
+
+        val bones = listOf(
+            11 to 12, 11 to 23, 12 to 24, 23 to 24,
+            11 to 13, 13 to 15, 12 to 14, 14 to 16,
+            23 to 25, 25 to 27, 24 to 26, 26 to 28
+        )
+
+        for ((s, e) in bones) {
+            if (s >= scaled.size || e >= scaled.size) continue
+            val (sx, sy, sc) = scaled[s]
+            val (ex, ey, ec) = scaled[e]
+            if (sc < 0.3f || ec < 0.3f) continue
+            canvas.drawLine(sx, sy, ex, ey, guidanceLinePaint)
+        }
+
+        // Draw head
+        if (scaled.size > 4) {
+            val (nx, ny, nc) = scaled[0]
+            if (nc > 0.3f) {
+                guidancePointPaint.color = Color.argb(180, 80, 80, 80)
+                canvas.drawCircle(nx, ny, 18f * dp, guidancePointPaint)
+            }
+        }
+
+        // Draw joints
+        val majorJoints = intArrayOf(11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
+        for (i in majorJoints) {
+            if (i >= scaled.size) continue
+            val (x, y, c) = scaled[i]
+            if (c < 0.3f) continue
+            guidancePointPaint.color = Color.argb(200, 60, 60, 60)
+            canvas.drawCircle(x, y, 5f * dp, guidancePointPaint)
+        }
+
+        // Title
+        hudPaint.textSize = 24f * dp
+        hudPaint.textAlign = Paint.Align.CENTER
+        hudPaint.color = Color.rgb(60, 60, 60)
+        canvas.drawText("NEXT POSE", width / 2f, height * 0.06f, hudPaint)
+
+        // State name
+        hudPaint.textSize = 16f * dp
+        hudPaint.color = Color.rgb(100, 100, 100)
+        canvas.drawText("Pose ${preview.stateId + 1}", width / 2f, height * 0.06f + 24f * dp, hudPaint)
+
+        // Countdown
+        hudPaint.textSize = 28f * dp
+        hudPaint.color = Color.rgb(40, 40, 40)
+        canvas.drawText(
+            String.format("Starting in %.1fs", guidanceRemainingSeconds),
+            width / 2f,
+            height * 0.92f,
+            hudPaint
+        )
+    }
+
+    // ── Utility ─────────────────────────────────────────────────────────
+
+    private fun getStatusBarHeight(): Int {
+        val resourceId = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (resourceId > 0) resources.getDimensionPixelSize(resourceId) else (24f * dp).toInt()
+    }
+
     companion object {
-        private const val LANDMARK_STROKE_WIDTH = 12f
+        private const val TAG = "OverlayView"
     }
 }
