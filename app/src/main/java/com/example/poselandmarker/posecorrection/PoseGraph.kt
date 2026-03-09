@@ -82,6 +82,20 @@ data class PoseState(
                 }
             }
 
+            // Apply mobile tolerance floors — graphs were trained from fixed laptop
+            // webcam; phone camera distance/angle varies much more.
+            for (key in tolerances.keys.toList()) {
+                val floor = when {
+                    key == "body_center_y" -> 1.0f   // Very camera-distance-dependent
+                    key.endsWith("_elevation") -> 0.3f // Camera-angle-dependent
+                    key.endsWith("_spread") -> 0.2f   // Camera-angle-dependent
+                    else -> null
+                }
+                if (floor != null) {
+                    tolerances[key] = maxOf(tolerances[key] ?: floor, floor)
+                }
+            }
+
             return PoseState(
                 stateId = json.getInt("state_id"),
                 meanFeatures = meanFeatures,

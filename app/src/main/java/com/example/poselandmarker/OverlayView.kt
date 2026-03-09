@@ -130,6 +130,10 @@ class OverlayView @JvmOverloads constructor(
         color = Color.argb(200, 50, 50, 50)
     }
 
+    private val guidanceFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+
     // Colors
     private val colorGreen = Color.rgb(76, 175, 80)
     private val colorOrange = Color.rgb(255, 152, 0)
@@ -589,6 +593,21 @@ class OverlayView @JvmOverloads constructor(
         val bodyLabelH = (18f * dp).toInt()
         val scaled = scaleKeypointsToPanel(keypoints, panelW, panelH - bodyLabelH, panelX, panelY + bodyLabelH, cocoBodyOnly = true)
 
+        // Draw filled torso polygon for readability (COCO: 5=l_shoulder, 6=r_shoulder, 12=r_hip, 11=l_hip)
+        if (scaled.size > 12) {
+            val ls = scaled[5]; val rs = scaled[6]; val rh = scaled[12]; val lh = scaled[11]
+            if (ls.third > 0.3f && rs.third > 0.3f && lh.third > 0.3f && rh.third > 0.3f) {
+                val path = Path()
+                path.moveTo(ls.first, ls.second)
+                path.lineTo(rs.first, rs.second)
+                path.lineTo(rh.first, rh.second)
+                path.lineTo(lh.first, lh.second)
+                path.close()
+                guidanceFillPaint.color = Color.argb(35, 200, 200, 200)
+                canvas.drawPath(path, guidanceFillPaint)
+            }
+        }
+
         // Draw bones using COCO indices with per-joint error coloring
         for ((s, e) in cocoBones) {
             if (s >= scaled.size || e >= scaled.size) continue
@@ -658,8 +677,8 @@ class OverlayView @JvmOverloads constructor(
     ): List<Triple<Float, Float, Float>> {
         // Filter for bounding box computation
         val valid = when {
-            // COCO 17-keypoint format: body joints are 5-16
-            cocoBodyOnly -> keypoints.filterIndexed { i, kp -> i in 5..16 && kp.third > 0.3f }
+            // COCO 17-keypoint format: body joints 5-16 PLUS nose (0) for head room
+            cocoBodyOnly -> keypoints.filterIndexed { i, kp -> (i == 0 || i in 5..16) && kp.third > 0.3f }
             // MediaPipe 33-keypoint format: body joints are 11-28
             bodyOnly -> keypoints.filterIndexed { i, kp -> i in 11..28 && kp.third > 0.3f }
             else -> keypoints.filter { it.third > 0.3f }
@@ -673,8 +692,12 @@ class OverlayView @JvmOverloads constructor(
         val rangeX = (maxX - minX).coerceAtLeast(1f)
         val rangeY = (maxY - minY).coerceAtLeast(1f)
 
-        // Leave room for head above shoulders (add 15% top padding if bodyOnly)
-        val topPad = if (bodyOnly) 0.18f else 0.12f
+        // Leave room for head circle above body + small bottom margin
+        val topPad = when {
+            cocoBodyOnly -> 0.10f
+            bodyOnly -> 0.18f
+            else -> 0.12f
+        }
         val padding = 0.10f
         val scale = min(
             panelW * (1 - 2 * padding) / rangeX,
@@ -710,14 +733,33 @@ class OverlayView @JvmOverloads constructor(
 
     private fun drawGuidanceOverlay(canvas: Canvas) {
         // Dark translucent overlay (not opaque white)
-        canvas.drawColor(Color.argb(220, 20, 20, 30))
+        canvas.drawColor(Color.argb(200, 15, 15, 25))
 
         val preview = nextStatePreview ?: return
         val keypoints = preview.meanKeypoints ?: return
 
         // Draw ghost skeleton scaled to full screen
         // NOTE: keypoints are COCO 17-format, so use cocoBodyOnly bounding box
-        val scaled = scaleKeypointsToPanel(keypoints, width, (height * 0.65f).toInt(), 0, (height * 0.12f).toInt(), cocoBodyOnly = true)
+        val scaled = scaleKeypointsToPanel(keypoints, width, (height * 0.70f).toInt(), 0, (height * 0.08f).toInt(), cocoBodyOnly = true)
+
+        val greenGlow = Color.argb(200, 76, 175, 80)
+        val greenFaint = Color.argb(50, 76, 175, 80)
+        val greenFill = Color.argb(30, 76, 175, 80)
+
+        // Draw filled torso polygon (COCO: 5=l_shoulder, 6=r_shoulder, 12=r_hip, 11=l_hip)
+        if (scaled.size > 12) {
+            val ls = scaled[5]; val rs = scaled[6]; val rh = scaled[12]; val lh = scaled[11]
+            if (ls.third > 0.3f && rs.third > 0.3f && lh.third > 0.3f && rh.third > 0.3f) {
+                val path = Path()
+                path.moveTo(ls.first, ls.second)
+                path.lineTo(rs.first, rs.second)
+                path.lineTo(rh.first, rh.second)
+                path.lineTo(lh.first, lh.second)
+                path.close()
+                guidanceFillPaint.color = greenFill
+                canvas.drawPath(path, guidanceFillPaint)
+            }
+        }
 
         // Draw bones using COCO indices with glow effect
         for ((s, e) in cocoBones) {
@@ -727,12 +769,12 @@ class OverlayView @JvmOverloads constructor(
             if (sc < 0.3f || ec < 0.3f) continue
 
             // Glow layer
-            guidanceLinePaint.color = Color.argb(50, 76, 175, 80)
-            guidanceLinePaint.strokeWidth = 14f * dp
+            guidanceLinePaint.color = greenFaint
+            guidanceLinePaint.strokeWidth = 16f * dp
             canvas.drawLine(sx, sy, ex, ey, guidanceLinePaint)
 
             // Main line
-            guidanceLinePaint.color = Color.argb(200, 76, 175, 80)
+            guidanceLinePaint.color = greenGlow
             guidanceLinePaint.strokeWidth = 6f * dp
             canvas.drawLine(sx, sy, ex, ey, guidanceLinePaint)
         }
@@ -746,13 +788,13 @@ class OverlayView @JvmOverloads constructor(
             val (lsx, lsy, lsc) = scaled[5]   // COCO left_shoulder
             val (rsx, rsy, rsc) = scaled[6]   // COCO right_shoulder
             if (nc > 0.3f) {
-                guidancePointPaint.color = Color.argb(180, 76, 175, 80)
-                canvas.drawCircle(nx, ny, 20f * dp, guidancePointPaint)
+                guidancePointPaint.color = greenGlow
+                canvas.drawCircle(nx, ny, 22f * dp, guidancePointPaint)
                 // Neck line
                 if (lsc > 0.3f && rsc > 0.3f) {
                     val neckX = (lsx + rsx) / 2f
                     val neckY = (lsy + rsy) / 2f
-                    guidanceLinePaint.color = Color.argb(200, 76, 175, 80)
+                    guidanceLinePaint.color = greenGlow
                     guidanceLinePaint.strokeWidth = 6f * dp
                     canvas.drawLine(nx, ny, neckX, neckY, guidanceLinePaint)
                 }
@@ -765,23 +807,23 @@ class OverlayView @JvmOverloads constructor(
             val (x, y, c) = scaled[i]
             if (c < 0.3f) continue
             // Outer glow
-            guidancePointPaint.color = Color.argb(60, 76, 175, 80)
+            guidancePointPaint.color = greenFaint
             canvas.drawCircle(x, y, 10f * dp, guidancePointPaint)
             // Inner point
-            guidancePointPaint.color = Color.argb(220, 100, 200, 100)
-            canvas.drawCircle(x, y, 5f * dp, guidancePointPaint)
+            guidancePointPaint.color = Color.argb(230, 120, 220, 120)
+            canvas.drawCircle(x, y, 5.5f * dp, guidancePointPaint)
         }
 
         // Title
-        hudPaint.textSize = 22f * dp
+        hudPaint.textSize = 24f * dp
         hudPaint.textAlign = Paint.Align.CENTER
-        hudPaint.color = Color.rgb(200, 200, 200)
-        canvas.drawText("GET READY", width / 2f, height * 0.06f, hudPaint)
+        hudPaint.color = Color.rgb(230, 230, 230)
+        canvas.drawText("GET READY", width / 2f, height * 0.05f, hudPaint)
 
         // State name
         hudPaint.textSize = 16f * dp
         hudPaint.color = Color.rgb(76, 175, 80)
-        canvas.drawText("Next: Pose ${preview.stateId + 1}", width / 2f, height * 0.06f + 26f * dp, hudPaint)
+        canvas.drawText("Next: Pose ${preview.stateId + 1}", width / 2f, height * 0.05f + 26f * dp, hudPaint)
 
         // Countdown - large centered
         hudPaint.textSize = 48f * dp

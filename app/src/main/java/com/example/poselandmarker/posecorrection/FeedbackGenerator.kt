@@ -101,34 +101,41 @@ class FeedbackGenerator(
     }
 
     private fun generateSpecificFeedback(featureName: String, signedDeviation: Float): String {
+        // signedDeviation = current - mean.  Positive = feature value is HIGHER than target.
+        // For angles: higher = more straight/open.  For elevations: higher = arm raised more.
         return when {
             featureName.contains("elbow") -> {
+                // Higher angle = straighter arm.  signedDev > 0 → too straight → bend more
                 val side = if (featureName.contains("left")) "left" else "right"
-                if (signedDeviation > 0) "Straighten $side arm more" else "Bend $side elbow deeper"
+                if (signedDeviation > 0) "Bend $side elbow more" else "Straighten $side arm"
             }
 
             featureName.contains("knee") -> {
+                // Higher angle = straighter leg.  signedDev > 0 → too straight → bend more
                 val side = if (featureName.contains("left")) "left" else "right"
-                if (signedDeviation > 0) "Straighten $side leg" else "Bend $side knee more"
+                if (signedDeviation > 0) "Bend $side knee more" else "Straighten $side leg"
             }
 
             featureName.contains("hip") -> {
-                if (signedDeviation > 0) "Hinge forward at hips more" else "Straighten hips, stand taller"
+                // Higher angle = more open/straight hip.  signedDev > 0 → too straight → bend
+                if (signedDeviation > 0) "Hinge forward at hips" else "Stand taller, extend hips"
             }
 
             featureName.contains("shoulder") -> {
+                // Higher angle = arm more raised from body.  signedDev > 0 → too high → lower
                 val side = if (featureName.contains("left")) "left" else "right"
-                if (signedDeviation > 0) "Raise $side arm higher" else "Lower $side arm"
+                if (signedDeviation > 0) "Lower $side arm" else "Raise $side arm higher"
             }
 
             featureName.contains("torso") -> {
-                if (signedDeviation > 0) "Lean torso forward slightly" else "Bring torso more upright"
+                // Positive torso_angle = leaning forward.  signedDev > 0 → too forward → upright
+                if (signedDeviation > 0) "Stand more upright" else "Lean forward slightly"
             }
 
             featureName.contains("arm_elevation") -> {
                 val side = if (featureName.contains("left")) "left" else "right"
-                // Positive deviation = arm higher than target
-                if (signedDeviation > 0) "Lower $side arm slightly" else "Raise $side arm higher"
+                // Positive elevation = arm above shoulder.  signedDev > 0 → too high → lower
+                if (signedDeviation > 0) "Lower $side arm" else "Raise $side arm higher"
             }
 
             featureName.contains("leg_spread") -> {

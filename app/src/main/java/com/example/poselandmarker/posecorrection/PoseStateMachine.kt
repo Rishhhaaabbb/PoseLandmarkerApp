@@ -91,13 +91,14 @@ class PoseStateMachine(
         return scale
     }
 
-    // ── Accuracy tracking (ratio-based, not binary) ────────────────────
-    private var matchRatioAccumulator: Float = 0f
-    private var evaluatedFrames: Int = 0
+    // ── Accuracy tracking (rolling window for responsive feedback) ─────
+    private val accuracyWindow = ArrayDeque<Float>()   // recent match ratios
+    private val accuracyWindowSize = 60                 // ~2s at 30fps
 
-    /** Current accuracy percentage [0, 100] based on average match ratio */
+    /** Current accuracy percentage [0, 100] based on rolling window average */
     val accuracyPercent: Int get() {
-        return if (evaluatedFrames > 0) ((matchRatioAccumulator / evaluatedFrames) * 100).toInt().coerceIn(0, 100) else 0
+        if (accuracyWindow.isEmpty()) return 0
+        return (accuracyWindow.average() * 100).toInt().coerceIn(0, 100)
     }
 
     // ── Streak tracking ─────────────────────────────────────────────────
@@ -177,9 +178,9 @@ class PoseStateMachine(
             kotlin.math.abs(signedDev) / scaledTol
         }
 
-        // ── Accuracy tracking (accumulate match ratio, not binary) ────
-        evaluatedFrames++
-        matchRatioAccumulator += bestResult.matchRatio
+        // ── Accuracy tracking (rolling window) ────────────────────
+        accuracyWindow.addLast(bestResult.matchRatio)
+        while (accuracyWindow.size > accuracyWindowSize) accuracyWindow.removeFirst()
         if (isInTargetPose) {
             currentStreak++
             if (currentStreak > maxStreak) maxStreak = currentStreak
@@ -280,8 +281,7 @@ class PoseStateMachine(
         noMatchStartTimeMs = 0
 
         // Reset accuracy for new state
-        matchRatioAccumulator = 0f
-        evaluatedFrames = 0
+        accuracyWindow.clear()
         currentStreak = 0
     }
 
@@ -322,8 +322,7 @@ class PoseStateMachine(
         wasHoldingLastFrame = false
         lastTransitionTimeMs = 0
         noMatchStartTimeMs = 0
-        matchRatioAccumulator = 0f
-        evaluatedFrames = 0
+        accuracyWindow.clear()
         currentStreak = 0
         maxStreak = 0
         currentDeviations = emptyMap()
