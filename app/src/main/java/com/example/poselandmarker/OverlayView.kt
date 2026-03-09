@@ -5,7 +5,6 @@ import android.graphics.*
 import android.util.AttributeSet
 import android.view.View
 import com.example.poselandmarker.posecorrection.PoseState
-import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarker
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 import kotlin.math.abs
 import kotlin.math.max
@@ -155,15 +154,38 @@ class OverlayView @JvmOverloads constructor(
         27 to "left_knee_angle",   28 to "right_knee_angle"    // ankles inherit from knees
     )
 
-    // Adjacency: for landmarks with no feature, inherit from nearest mapped neighbor
+    // Adjacency: for unmapped body landmarks, inherit from nearest mapped neighbor
+    // Face (0-10) and hand/foot details (17-22, 29-32) are NOT drawn, so no fallback needed
     private val jointErrorFallback = mapOf(
-        0 to 11,   // nose → left shoulder
-        1 to 11, 2 to 12, 3 to 11, 4 to 12,  // eyes/ears → shoulders
-        5 to 11, 6 to 12, 7 to 13, 8 to 14,  // unused MP indices
-        9 to 15, 10 to 16,
-        17 to 15, 18 to 16, 19 to 15, 20 to 16,  // hand landmarks
-        21 to 15, 22 to 16,
-        29 to 27, 30 to 28, 31 to 27, 32 to 28   // foot landmarks
+        27 to 25, 28 to 26   // ankles inherit from knees (already in jointFeatureMap too)
+    )
+
+    // Only draw these body-relevant landmarks (skip face 0-10, hands 17-22, feet 29-32)
+    private val bodyLandmarkIndices = intArrayOf(11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
+
+    // Body-only bone connections using MediaPipe indices
+    private val bodyBones = listOf(
+        11 to 12, 11 to 23, 12 to 24, 23 to 24,  // torso
+        11 to 13, 13 to 15, 12 to 14, 14 to 16,  // arms
+        23 to 25, 25 to 27, 24 to 26, 26 to 28   // legs
+    )
+
+    // COCO 17-keypoint bone connections for mini skeleton / guidance (graphs use COCO format)
+    private val cocoBones = listOf(
+        5 to 6, 5 to 11, 6 to 12, 11 to 12,   // torso
+        5 to 7, 7 to 9, 6 to 8, 8 to 10,      // arms
+        11 to 13, 13 to 15, 12 to 14, 14 to 16 // legs
+    )
+    private val cocoBodyJoints = intArrayOf(5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+
+    // COCO joint → feature name mapping for mini skeleton error coloring
+    private val cocoJointFeatureMap = mapOf(
+        7 to "left_elbow_angle",   8 to "right_elbow_angle",
+        13 to "left_knee_angle",   14 to "right_knee_angle",
+        5 to "left_shoulder_angle", 6 to "right_shoulder_angle",
+        11 to "left_hip_angle",    12 to "right_hip_angle",
+        9 to "left_arm_elevation", 10 to "right_arm_elevation",
+        15 to "left_knee_angle",   16 to "right_knee_angle"
     )
 
     // ── Public API ──────────────────────────────────────────────────────
@@ -281,14 +303,12 @@ class OverlayView @JvmOverloads constructor(
             else -> colorOrange
         }
 
-        // Draw connections using official POSE_LANDMARKS
-        PoseLandmarker.POSE_LANDMARKS.forEach { connection ->
-            val startIdx = connection!!.start()
-            val endIdx = connection.end()
+        // Draw only body-relevant bone connections (skip face/hand/foot clutter)
+        for ((startIdx, endIdx) in bodyBones) {
+            if (startIdx >= landmarks.size || endIdx >= landmarks.size) continue
             val startLm = landmarks[startIdx]
             val endLm = landmarks[endIdx]
 
-            // Determine color based on per-joint errors
             val startError = getJointErrorRatio(startIdx)
             val endError = getJointErrorRatio(endIdx)
             val maxError = max(startError, endError)
@@ -310,8 +330,29 @@ class OverlayView @JvmOverloads constructor(
             )
         }
 
-        // Draw landmark points with color coding
-        for (i in landmarks.indices) {
+        // Draw head circle connecting to shoulder midpoint
+        if (landmarks.size > 12) {
+            val nose = landmarks[0]
+            val lShoulder = landmarks[11]
+            val rShoulder = landmarks[12]
+            val neckX = (lShoulder.x() + rShoulder.x()) / 2f * imageWidth * scaleFactor
+            val neckY = (lShoulder.y() + rShoulder.y()) / 2f * imageHeight * scaleFactor
+            val headX = nose.x() * imageWidth * scaleFactor
+            val headY = nose.y() * imageHeight * scaleFactor
+
+            linePaint.color = when {
+                isInGracePeriod -> colorCyan
+                isMatching -> colorGreen
+                else -> colorOrange
+            }
+            canvas.drawLine(headX, headY, neckX, neckY, linePaint)
+            pointPaint.color = linePaint.color
+            canvas.drawCircle(headX, headY, 8f * dp, pointPaint)
+        }
+
+        // Draw only body landmark points (11-16, 23-28) — no face/hand/foot noise
+        for (i in bodyLandmarkIndices) {
+            if (i >= landmarks.size) continue
             val lm = landmarks[i]
             val x = lm.x() * imageWidth * scaleFactor
             val y = lm.y() * imageHeight * scaleFactor
@@ -326,7 +367,7 @@ class OverlayView @JvmOverloads constructor(
             }
 
             val radius = when {
-                errorRatio > 1.0f -> 7f * dp   // Larger for deviating joints
+                errorRatio > 1.0f -> 7f * dp
                 else -> 5f * dp
             }
             canvas.drawCircle(x, y, radius, pointPaint)
@@ -352,6 +393,15 @@ class OverlayView @JvmOverloads constructor(
         }
         // Truly unmapped → assume OK
         return 0f
+    }
+
+    /** Error ratio lookup for COCO 17-keypoint indices (used by mini skeleton & guidance) */
+    private fun getCocoJointErrorRatio(cocoIndex: Int): Float {
+        if (perJointErrorRatios.isEmpty()) {
+            return if (isMatching) 0f else 0.8f
+        }
+        val featureName = cocoJointFeatureMap[cocoIndex] ?: return 0f
+        return perJointErrorRatios[featureName] ?: 0f
     }
 
     // ── Top HUD ─────────────────────────────────────────────────────────
@@ -533,26 +583,21 @@ class OverlayView @JvmOverloads constructor(
         canvas.drawText("TARGET POSE", panelX + panelW / 2f, panelY + 14f * dp, textPaint)
         textPaint.textAlign = Paint.Align.LEFT
 
-        // Scale keypoints using BODY-ONLY bounding box (landmarks 11-28)
+        // Scale keypoints using BODY-ONLY bounding box
+        // NOTE: Graphs use COCO 17-keypoint format (5=l_shoulder, 6=r_shoulder,
+        //       11=l_hip, 12=r_hip, etc.) — NOT MediaPipe 33-keypoint indices!
         val bodyLabelH = (18f * dp).toInt()
-        val scaled = scaleKeypointsToPanel(keypoints, panelW, panelH - bodyLabelH, panelX, panelY + bodyLabelH, bodyOnly = true)
+        val scaled = scaleKeypointsToPanel(keypoints, panelW, panelH - bodyLabelH, panelX, panelY + bodyLabelH, cocoBodyOnly = true)
 
-        // Draw bones with per-joint error coloring
-        val bones = listOf(
-            11 to 12, 11 to 23, 12 to 24, 23 to 24,  // torso
-            11 to 13, 13 to 15, 12 to 14, 14 to 16,  // arms
-            23 to 25, 25 to 27, 24 to 26, 26 to 28   // legs
-        )
-
-        for ((s, e) in bones) {
+        // Draw bones using COCO indices with per-joint error coloring
+        for ((s, e) in cocoBones) {
             if (s >= scaled.size || e >= scaled.size) continue
             val (sx, sy, sc) = scaled[s]
             val (ex, ey, ec) = scaled[e]
             if (sc < 0.3f || ec < 0.3f) continue
 
-            // Color based on error ratios for these joints
-            val startErr = getJointErrorRatio(s)
-            val endErr = getJointErrorRatio(e)
+            val startErr = getCocoJointErrorRatio(s)
+            val endErr = getCocoJointErrorRatio(e)
             val maxErr = max(startErr, endErr)
 
             miniSkeletonPaint.color = when {
@@ -565,14 +610,13 @@ class OverlayView @JvmOverloads constructor(
             canvas.drawLine(sx, sy, ex, ey, miniSkeletonPaint)
         }
 
-        // Draw joints with error coloring
-        val majorJoints = intArrayOf(11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
-        for (i in majorJoints) {
+        // Draw joints using COCO indices with error coloring
+        for (i in cocoBodyJoints) {
             if (i >= scaled.size) continue
             val (x, y, c) = scaled[i]
             if (c < 0.3f) continue
 
-            val errRatio = getJointErrorRatio(i)
+            val errRatio = getCocoJointErrorRatio(i)
             miniPointPaint.color = when {
                 perJointErrorRatios.isEmpty() -> Color.rgb(150, 220, 150)
                 errRatio > 1.5f -> colorRed
@@ -584,16 +628,16 @@ class OverlayView @JvmOverloads constructor(
             canvas.drawCircle(x, y, r, miniPointPaint)
         }
 
-        // Draw head circle
-        if (scaled.size > 4) {
+        // Draw head circle (COCO index 0 = nose)
+        if (scaled.isNotEmpty()) {
             val (nx, ny, nc) = scaled[0]
             if (nc > 0.3f) {
                 miniPointPaint.color = Color.rgb(200, 180, 160)
                 canvas.drawCircle(nx, ny, 7f * dp, miniPointPaint)
-                // Neck line from head to midpoint of shoulders
-                if (scaled.size > 12) {
-                    val (lsx, lsy, lsc) = scaled[11]
-                    val (rsx, rsy, rsc) = scaled[12]
+                // Neck line from head to midpoint of shoulders (COCO 5, 6)
+                if (scaled.size > 6) {
+                    val (lsx, lsy, lsc) = scaled[5]   // COCO left_shoulder
+                    val (rsx, rsy, rsc) = scaled[6]   // COCO right_shoulder
                     if (lsc > 0.3f && rsc > 0.3f) {
                         val neckX = (lsx + rsx) / 2f
                         val neckY = (lsy + rsy) / 2f
@@ -609,13 +653,16 @@ class OverlayView @JvmOverloads constructor(
         keypoints: List<Triple<Float, Float, Float>>,
         panelW: Int, panelH: Int,
         offsetX: Int, offsetY: Int,
-        bodyOnly: Boolean = false
+        bodyOnly: Boolean = false,
+        cocoBodyOnly: Boolean = false
     ): List<Triple<Float, Float, Float>> {
-        // If bodyOnly, compute bounding box from landmarks 11-28 only (skip face 0-10)
-        val valid = if (bodyOnly) {
-            keypoints.filterIndexed { i, kp -> i in 11..28 && kp.third > 0.3f }
-        } else {
-            keypoints.filter { it.third > 0.3f }
+        // Filter for bounding box computation
+        val valid = when {
+            // COCO 17-keypoint format: body joints are 5-16
+            cocoBodyOnly -> keypoints.filterIndexed { i, kp -> i in 5..16 && kp.third > 0.3f }
+            // MediaPipe 33-keypoint format: body joints are 11-28
+            bodyOnly -> keypoints.filterIndexed { i, kp -> i in 11..28 && kp.third > 0.3f }
+            else -> keypoints.filter { it.third > 0.3f }
         }
         if (valid.isEmpty()) return keypoints.map { Triple(0f, 0f, 0f) }
 
@@ -668,17 +715,12 @@ class OverlayView @JvmOverloads constructor(
         val preview = nextStatePreview ?: return
         val keypoints = preview.meanKeypoints ?: return
 
-        // Draw ghost skeleton scaled to full screen, body-only bounding box
-        val scaled = scaleKeypointsToPanel(keypoints, width, (height * 0.65f).toInt(), 0, (height * 0.12f).toInt(), bodyOnly = true)
+        // Draw ghost skeleton scaled to full screen
+        // NOTE: keypoints are COCO 17-format, so use cocoBodyOnly bounding box
+        val scaled = scaleKeypointsToPanel(keypoints, width, (height * 0.65f).toInt(), 0, (height * 0.12f).toInt(), cocoBodyOnly = true)
 
-        val bones = listOf(
-            11 to 12, 11 to 23, 12 to 24, 23 to 24,
-            11 to 13, 13 to 15, 12 to 14, 14 to 16,
-            23 to 25, 25 to 27, 24 to 26, 26 to 28
-        )
-
-        // Draw bones with a glow effect
-        for ((s, e) in bones) {
+        // Draw bones using COCO indices with glow effect
+        for ((s, e) in cocoBones) {
             if (s >= scaled.size || e >= scaled.size) continue
             val (sx, sy, sc) = scaled[s]
             val (ex, ey, ec) = scaled[e]
@@ -698,11 +740,11 @@ class OverlayView @JvmOverloads constructor(
         // Reset stroke width
         guidanceLinePaint.strokeWidth = 8f * dp
 
-        // Draw head with neck
-        if (scaled.size > 12) {
+        // Draw head with neck (COCO: 0=nose, 5=l_shoulder, 6=r_shoulder)
+        if (scaled.size > 6) {
             val (nx, ny, nc) = scaled[0]
-            val (lsx, lsy, lsc) = scaled[11]
-            val (rsx, rsy, rsc) = scaled[12]
+            val (lsx, lsy, lsc) = scaled[5]   // COCO left_shoulder
+            val (rsx, rsy, rsc) = scaled[6]   // COCO right_shoulder
             if (nc > 0.3f) {
                 guidancePointPaint.color = Color.argb(180, 76, 175, 80)
                 canvas.drawCircle(nx, ny, 20f * dp, guidancePointPaint)
@@ -717,9 +759,8 @@ class OverlayView @JvmOverloads constructor(
             }
         }
 
-        // Draw joints
-        val majorJoints = intArrayOf(11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
-        for (i in majorJoints) {
+        // Draw joints using COCO body indices
+        for (i in cocoBodyJoints) {
             if (i >= scaled.size) continue
             val (x, y, c) = scaled[i]
             if (c < 0.3f) continue
